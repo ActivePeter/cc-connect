@@ -111,26 +111,30 @@ type replyContext struct {
 	chatID          string
 	sessionKey      string
 	bootstrapThread bool
+	requesterID     string
+	requesterName   string
+	groupChat       bool
 }
 
 type Platform struct {
-	mu                         sync.RWMutex
-	platformName               string
-	domain                     string
-	appID                      string
-	appSecret                  string
-	progressStyle              string
-	useInteractiveCard         bool
-	self                       core.Platform
-	reactionEmoji              string
-	doneEmoji                  string
-	allowFrom                  string
-	allowChat                  string
-	groupOnly                  bool
-	groupReplyAll              bool
-	respondToAtEveryoneAndHere bool
-	shareSessionInChannel      bool
-	threadIsolation            bool
+	mu                           sync.RWMutex
+	platformName                 string
+	domain                       string
+	appID                        string
+	appSecret                    string
+	progressStyle                string
+	useInteractiveCard           bool
+	self                         core.Platform
+	reactionEmoji                string
+	doneEmoji                    string
+	allowFrom                    string
+	allowChat                    string
+	groupOnly                    bool
+	groupReplyAll                bool
+	respondToAtEveryoneAndHere   bool
+	shareSessionInChannel        bool
+	threadIsolation              bool
+	mentionRequesterOnCompletion bool
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	resolveMentions  bool
@@ -311,6 +315,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
+	mentionRequesterOnCompletion, _ := opts["mention_requester_on_completion"].(bool)
 	resolveMentionsOpt, _ := opts["resolve_mentions"].(bool)
 	noReplyToTrigger := false
 	if v, ok := opts["reply_to_trigger"].(bool); ok && !v {
@@ -387,33 +392,34 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	}
 
 	base := &Platform{
-		platformName:               name,
-		domain:                     domain,
-		appID:                      appID,
-		appSecret:                  appSecret,
-		progressStyle:              progressStyle,
-		useInteractiveCard:         useInteractiveCard,
-		reactionEmoji:              reactionEmoji,
-		doneEmoji:                  doneEmoji,
-		allowFrom:                  allowFrom,
-		allowChat:                  allowChat,
-		groupOnly:                  groupOnly,
-		groupReplyAll:              groupReplyAll,
-		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
-		shareSessionInChannel:      shareSessionInChannel,
-		threadIsolation:            threadIsolation,
-		resolveMentions:            resolveMentionsOpt,
-		noReplyToTrigger:           noReplyToTrigger,
-		client:                     lark.NewClient(appID, appSecret, clientOpts...),
-		replayClient:               newFeishuReplayClient(appID, appSecret, domain),
-		dedup:                      &core.MessageDedup{},
-		port:                       port,
-		callbackPath:               callbackPath,
-		encryptKey:                 encryptKey,
-		peerBots:                   peerBots,
-		mentionMap:                 mentionMap,
-		imageBatch:                 make(map[string]*imageBatchEntry),
-		imageBatchWindow:           imageBatchWindow,
+		platformName:                 name,
+		domain:                       domain,
+		appID:                        appID,
+		appSecret:                    appSecret,
+		progressStyle:                progressStyle,
+		useInteractiveCard:           useInteractiveCard,
+		reactionEmoji:                reactionEmoji,
+		doneEmoji:                    doneEmoji,
+		allowFrom:                    allowFrom,
+		allowChat:                    allowChat,
+		groupOnly:                    groupOnly,
+		groupReplyAll:                groupReplyAll,
+		respondToAtEveryoneAndHere:   respondToAtEveryoneAndHere,
+		shareSessionInChannel:        shareSessionInChannel,
+		threadIsolation:              threadIsolation,
+		mentionRequesterOnCompletion: mentionRequesterOnCompletion,
+		resolveMentions:              resolveMentionsOpt,
+		noReplyToTrigger:             noReplyToTrigger,
+		client:                       lark.NewClient(appID, appSecret, clientOpts...),
+		replayClient:                 newFeishuReplayClient(appID, appSecret, domain),
+		dedup:                        &core.MessageDedup{},
+		port:                         port,
+		callbackPath:                 callbackPath,
+		encryptKey:                   encryptKey,
+		peerBots:                     peerBots,
+		mentionMap:                   mentionMap,
+		imageBatch:                   make(map[string]*imageBatchEntry),
+		imageBatchWindow:             imageBatchWindow,
 	}
 	if !useInteractiveCard {
 		base.self = base
@@ -1432,7 +1438,12 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	mentions := msg.Mentions
 	parentID := stringValue(msg.ParentId)
 
-	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey, groupChat: chatType == "group"}
+	// Snapshot the actual human sender, not mentions in the prompt or mutable
+	// session state. Each queued turn must keep its own completion recipient.
+	if stringValue(sender.SenderType) == "user" {
+		rctx.requesterID = userID
+	}
 	slog.Debug(p.tag()+": routed inbound message",
 		"message_id", messageID,
 		"session_key", sessionKey,
@@ -1480,6 +1491,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 	if userID != "" {
 		userName = p.resolveUserName(userID)
 	}
+	rctx.requesterName = userName
 	chatName := p.resolveChatName(chatID)
 
 	// If this message is a reply to another message, fetch the quoted content

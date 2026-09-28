@@ -486,7 +486,8 @@ type Engine struct {
 	webStatusFunc func() (url string)
 
 	// Data directory for socket path injection
-	dataDir string
+	dataDir    string
+	batchInbox *BatchInbox
 }
 
 // workspaceInitFlow tracks a channel that is being onboarded to a workspace.
@@ -519,6 +520,7 @@ type queuedMessage struct {
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
 	agentSession             AgentSession
+	lastTurnSucceeded        bool
 	platform                 Platform
 	replyCtx                 any
 	currentMessageID         string
@@ -2329,6 +2331,7 @@ func (e *Engine) Start() error {
 	}
 
 	e.startObserver()
+	e.startBatchInbox()
 	return nil
 }
 
@@ -2819,6 +2822,10 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		UserName:   msg.UserName,
 		Content:    msg.Content,
 	})
+
+	if e.interceptBatchMessage(p, msg) {
+		return
+	}
 
 	// Voice message: transcribe to text first
 	if msg.Audio != nil {
@@ -4640,10 +4647,16 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					fullResponse = strings.Join(textParts, "")
 				}
 
-				if fullResponse != "" {
+				delivered := fullResponse != ""
+				if delivered {
 					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
-						e.send(p, replyCtx, chunk)
+						if err := e.sendWithError(p, replyCtx, chunk); err != nil {
+							delivered = false
+						}
 					}
+				}
+				if event.Done && delivered && hasVisibleFinalReply(fullResponse) {
+					e.notifyFinalReply(p, replyCtx)
 				}
 
 				// Safety note: concurrent writes to session.History by the
@@ -4748,6 +4761,24 @@ var agentErrorHandlers = []agentErrorHandler{
 }
 
 func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any) {
+	input := ""
+	for _, h := range session.GetHistory(1) {
+		if h.Role == "user" {
+			input = h.Content
+		}
+	}
+	state.mu.Lock()
+	state.lastTurnSucceeded = false
+	turnPlatform := state.platform.Name()
+	state.mu.Unlock()
+	turnEvent := e.beginTurnHook(session, sessionKey, turnPlatform, input)
+	defer func() {
+		reason := "error_or_interrupted"
+		if state.isStopped() || e.ctx.Err() != nil {
+			reason = "stopped"
+		}
+		turnEvent.end(reason, "")
+	}()
 	if msgID != "" {
 		state.mu.Lock()
 		state.currentMessageID = msgID
@@ -5823,6 +5854,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 
+			if !isSilent {
+				e.notifyFinalReply(p, replyCtx)
+			}
+
 			if elapsed := time.Since(replyStart); elapsed >= slowPlatformSend {
 				slog.Warn("slow final reply send", "platform", p.Name(), "elapsed", elapsed, "response_len", len(fullResponse))
 			}
@@ -5840,6 +5875,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			} else {
 				slog.Debug("tts: not enabled", "tts_nil", e.tts == nil, "enabled", e.tts != nil && e.tts.Enabled, "tts_obj_nil", e.tts == nil || e.tts.TTS == nil)
 			}
+
+			turnEvent.end("idle", baseResponse)
+			state.mu.Lock()
+			state.lastTurnSucceeded = true
+			state.mu.Unlock()
 
 			// Auto-compress after finishing a turn, before sending any queued messages.
 			if triggerAutoCompress {
@@ -5917,6 +5957,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 
+				turnEvent = e.beginTurnHook(session, sessionKey, queued.platform.Name(), queued.content)
+				state.mu.Lock()
+				state.lastTurnSucceeded = false
+				state.mu.Unlock()
 				queuedPrompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
 
 				state.mu.Lock()

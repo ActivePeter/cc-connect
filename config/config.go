@@ -468,11 +468,20 @@ type ReferenceConfig struct {
 }
 
 // ProjectConfig binds one agent (with a specific work_dir) to one or more platforms.
+type BatchInboxConfig struct {
+	ChannelPrefix string `toml:"channel_prefix"`
+	SessionKey    string `toml:"session_key"`
+	DebounceSecs  int    `toml:"debounce_secs"`
+	MaxWaitSecs   int    `toml:"max_wait_secs"`
+	Prompt        string `toml:"prompt"`
+}
+
 type ProjectConfig struct {
-	Name    string `toml:"name"`
-	Mode    string `toml:"mode,omitempty"`     // "" or "multi-workspace"
-	BaseDir string `toml:"base_dir,omitempty"` // parent dir for workspaces
-	SkipGit *bool  `toml:"skip_git,omitempty"`
+	BatchInbox BatchInboxConfig `toml:"batch_inbox"`
+	Name       string           `toml:"name"`
+	Mode       string           `toml:"mode,omitempty"`     // "" or "multi-workspace"
+	BaseDir    string           `toml:"base_dir,omitempty"` // parent dir for workspaces
+	SkipGit    *bool            `toml:"skip_git,omitempty"`
 	// WorkspaceInitAllowLocalPaths allows /workspace init and the conversational
 	// init flow to bind existing local directories. Default false keeps init
 	// limited to git URLs; use /workspace bind or /workspace route for explicit

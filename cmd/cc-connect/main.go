@@ -585,6 +585,11 @@ func main() {
 			engine.SetHooks(core.NewHookManager(proj.Name, coreHooks, shell, shellFlag, shellProfile))
 		}
 
+		if err := engine.SetBatchInbox(core.BatchInboxConfig{ChannelPrefix: proj.BatchInbox.ChannelPrefix, SessionKey: proj.BatchInbox.SessionKey, Debounce: time.Duration(proj.BatchInbox.DebounceSecs) * time.Second, MaxWait: time.Duration(proj.BatchInbox.MaxWaitSecs) * time.Second, Prompt: proj.BatchInbox.Prompt}); err != nil {
+			slog.Error("configure batch inbox", "project", proj.Name, "error", err)
+			os.Exit(1)
+		}
+
 		// Wire local reference normalization / rendering
 		engine.SetReferenceConfig(core.ReferenceRenderCfg{
 			NormalizeAgents: proj.References.NormalizeAgents,

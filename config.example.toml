@@ -1028,6 +1028,8 @@ app_secret = "your-feishu-app-secret"
 #                                   # 设为 true 时，群聊内所有用户共享同一个 Agent 会话
 # thread_isolation = false  # If true, group messages use Feishu reply threads as session boundaries (one thread/root = one agent session and, in multi-workspace mode, one workspace binding)
 #                           # 设为 true 时，群聊按飞书话题/根消息隔离会话；multi-workspace 模式下每个话题也独立绑定 workspace
+# mention_requester_on_completion = false  # Send one native @ of the human requester after each final group reply; progress and private chats are unaffected
+#                           # 群聊最终回复后 @ 本轮发起人一次；中间进度和私聊不受影响
 # reply_to_trigger = true   # Default: bot uses “reply to message” API (quotes the user’s message). Set false to post plain chat messages instead.
 #                           # 默认 true：用「回复消息」API（引用用户消息）。设为 false 则在会话里发普通消息、不引用触发消息。
 # progress_style = "legacy" # Progress rendering style: legacy | compact | card

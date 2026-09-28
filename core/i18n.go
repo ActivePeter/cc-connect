@@ -169,6 +169,7 @@ const (
 	MsgToolResultFmtOk           MsgKey = "tool_result_fmt_ok"
 	MsgToolResultFmtFailed       MsgKey = "tool_result_fmt_failed"
 	MsgExecutionStopped          MsgKey = "execution_stopped"
+	MsgFinalReplyComplete        MsgKey = "final_reply_complete"
 	MsgSessionCancelled          MsgKey = "session_cancelled"
 	MsgNoExecution               MsgKey = "no_execution"
 	MsgPreviousProcessing        MsgKey = "previous_processing"
@@ -378,31 +379,31 @@ const (
 	MsgCronIDLabel               MsgKey = "cron_id_label"
 	MsgCronFailedSuffix          MsgKey = "cron_failed_suffix"
 
-	MsgTimerNotAvailable  MsgKey = "timer_not_available"
-	MsgTimerUsage         MsgKey = "timer_usage"
-	MsgTimerAddUsage      MsgKey = "timer_add_usage"
-	MsgTimerAdded         MsgKey = "timer_added"
-	MsgTimerAddedExec     MsgKey = "timer_added_exec"
-	MsgTimerAddExecUsage  MsgKey = "timer_addexec_usage"
-	MsgTimerEmpty         MsgKey = "timer_empty"
-	MsgTimerListTitle     MsgKey = "timer_list_title"
-	MsgTimerListFooter    MsgKey = "timer_list_footer"
-	MsgTimerDelUsage      MsgKey = "timer_del_usage"
-	MsgTimerMuteUsage     MsgKey = "timer_mute_usage"
-	MsgTimerDeleted       MsgKey = "timer_deleted"
-	MsgTimerNotFound      MsgKey = "timer_not_found"
-	MsgTimerMuted         MsgKey = "timer_muted"
-	MsgTimerUnmuted       MsgKey = "timer_unmuted"
-	MsgTimerCardHint      MsgKey = "timer_card_hint"
-	MsgTimerBtnMute       MsgKey = "timer_btn_mute"
-	MsgTimerBtnUnmute     MsgKey = "timer_btn_unmute"
-	MsgTimerBtnDelete     MsgKey = "timer_btn_delete"
-	MsgTimerIDLabel       MsgKey = "timer_id_label"
-	MsgTimerScheduledLabel MsgKey = "timer_scheduled_label"
-	MsgTimerFailedSuffix  MsgKey = "timer_failed_suffix"
-	MsgCommandsTagAgent          MsgKey = "commands_tag_agent"
-	MsgCommandsTagShell          MsgKey = "commands_tag_shell"
-	MsgUpgradeTimeoutSuffix      MsgKey = "upgrade_timeout_suffix"
+	MsgTimerNotAvailable    MsgKey = "timer_not_available"
+	MsgTimerUsage           MsgKey = "timer_usage"
+	MsgTimerAddUsage        MsgKey = "timer_add_usage"
+	MsgTimerAdded           MsgKey = "timer_added"
+	MsgTimerAddedExec       MsgKey = "timer_added_exec"
+	MsgTimerAddExecUsage    MsgKey = "timer_addexec_usage"
+	MsgTimerEmpty           MsgKey = "timer_empty"
+	MsgTimerListTitle       MsgKey = "timer_list_title"
+	MsgTimerListFooter      MsgKey = "timer_list_footer"
+	MsgTimerDelUsage        MsgKey = "timer_del_usage"
+	MsgTimerMuteUsage       MsgKey = "timer_mute_usage"
+	MsgTimerDeleted         MsgKey = "timer_deleted"
+	MsgTimerNotFound        MsgKey = "timer_not_found"
+	MsgTimerMuted           MsgKey = "timer_muted"
+	MsgTimerUnmuted         MsgKey = "timer_unmuted"
+	MsgTimerCardHint        MsgKey = "timer_card_hint"
+	MsgTimerBtnMute         MsgKey = "timer_btn_mute"
+	MsgTimerBtnUnmute       MsgKey = "timer_btn_unmute"
+	MsgTimerBtnDelete       MsgKey = "timer_btn_delete"
+	MsgTimerIDLabel         MsgKey = "timer_id_label"
+	MsgTimerScheduledLabel  MsgKey = "timer_scheduled_label"
+	MsgTimerFailedSuffix    MsgKey = "timer_failed_suffix"
+	MsgCommandsTagAgent     MsgKey = "commands_tag_agent"
+	MsgCommandsTagShell     MsgKey = "commands_tag_shell"
+	MsgUpgradeTimeoutSuffix MsgKey = "upgrade_timeout_suffix"
 
 	MsgCronScheduleLabel MsgKey = "cron_schedule_label"
 	MsgCronNextRunLabel  MsgKey = "cron_next_run_label"
@@ -708,6 +709,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "failed",
 		LangJapanese:           "failed",
 		LangSpanish:            "fallido",
+	},
+	MsgFinalReplyComplete: {
+		LangEnglish:            "This reply is complete. See the result above.",
+		LangChinese:            "本轮回复已完成，请查看上方结果。",
+		LangTraditionalChinese: "本輪回覆已完成，請查看上方結果。",
+		LangJapanese:           "今回の返信が完了しました。上の結果をご確認ください。",
+		LangSpanish:            "Esta respuesta está completa. Consulta el resultado de arriba.",
 	},
 	MsgExecutionStopped: {
 		LangEnglish:            "⏹ Execution stopped.",

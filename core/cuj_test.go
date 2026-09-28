@@ -2412,3 +2412,46 @@ func TestCUJ_H4_FeishuTopicsKeepWorkspaceBindingsIsolated(t *testing.T) {
 		t.Fatalf("topic B changed after topic A unbind: %q", got)
 	}
 }
+
+// Three users queue work in one conversation. Intermediate progress remains
+// visible, and each final reply notifies its own requester exactly once.
+func TestCUJ_N1_CompletionMentionsFollowQueuedRequesters(t *testing.T) {
+	p := &completionTestPlatform{stubPlatformEngine: &stubPlatformEngine{n: "test"}}
+	a := &cujAgent{}
+	a.setNextSessionEvents([]Event{
+		{Type: EventThinking, Content: "Checking the requested work"},
+		{Type: EventToolUse, ToolName: "Bash"},
+		{Type: EventResult, Content: "compaction", Done: false},
+		{Type: EventResult, Content: "First final result", Done: true},
+	}, 100)
+	e := NewEngine("test", a, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+	defer e.Stop()
+	e.SetMaxQueuedMessages(8)
+	e.SetDisplayConfig(DisplayCfg{Mode: "full", ThinkingMessages: true, ThinkingMaxLen: 500, ToolMessages: false})
+	env := &cujEnv{t: t, engine: e, plat: p.stubPlatformEngine, agent: a}
+	for i, user := range []string{"alice", "bob", "carol"} {
+		e.ReceiveMessage(p, &Message{SessionKey: "test:shared", Platform: "test", MessageID: "msg-" + user, UserID: user, UserName: user, Content: "Please handle work from " + user, ReplyCtx: user})
+		if i == 0 {
+			env.waitFor("visible intermediate progress", 2*time.Second, func() bool { return env.sentContains("Checking the requested work") })
+			if got := completionMentions(p.getSent()); len(got) != 0 {
+				t.Fatalf("progress unexpectedly notified requester: %v", got)
+			}
+		}
+	}
+	env.waitFor("three final completion mentions", 3*time.Second, func() bool { return len(completionMentions(p.getSent())) == 3 })
+	sent := p.getSent()
+	mentions := completionMentions(sent)
+	for i, user := range []string{"alice", "bob", "carol"} {
+		if !strings.HasPrefix(mentions[i], "@"+user+" ") {
+			t.Fatalf("wrong completion order/recipient: %v", mentions)
+		}
+	}
+	for i, msg := range sent {
+		if strings.HasPrefix(msg, "@") && (i == 0 || strings.HasPrefix(sent[i-1], "@")) {
+			t.Fatalf("notification without preceding result: %v", sent)
+		}
+		if strings.Contains(msg, "Bash") || strings.Contains(msg, "compaction") {
+			t.Fatalf("hidden tool/nonterminal event leaked: %v", sent)
+		}
+	}
+}

@@ -25,8 +25,8 @@ import (
 // claudeSession manages a long-running Claude Code process using
 // --input-format stream-json and --permission-prompt-tool stdio.
 //
-// In "auto" mode, permission requests are auto-approved internally
-// (avoiding --dangerously-skip-permissions which fails under root).
+// Permission callbacks follow the effective mode confirmed by Claude's init
+// event, including command-line overrides of the configured launch mode.
 type claudeSession struct {
 	cmd             *exec.Cmd
 	stdin           io.WriteCloser
@@ -613,6 +613,21 @@ func resultSubtype(raw map[string]any) string {
 }
 
 func (cs *claudeSession) handleSystem(raw map[string]any) {
+	// CLI arguments can override the configured launch mode. In particular,
+	// --dangerously-skip-permissions may produce bypassPermissions even when
+	// cc-connect supplied auto. Keeping the launch mode here caused background
+	// callbacks to reach core's no-active-turn denial path despite CLI bypass.
+	// Only an init event can establish this mode; later status events must not
+	// overwrite a mode explicitly changed through SetLiveMode.
+	if subtype, _ := raw["subtype"].(string); subtype == "init" {
+		if mode, _ := raw["permissionMode"].(string); mode != "" {
+			switch mode {
+			case "default", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk":
+				cs.setPermissionMode(mode)
+				slog.Info("claudeSession: effective permission mode", "mode", mode)
+			}
+		}
+	}
 	if model, ok := raw["model"].(string); ok && model != "" {
 		cs.activeModel.Store(model)
 	}
