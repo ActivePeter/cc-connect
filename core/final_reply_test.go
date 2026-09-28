@@ -63,7 +63,7 @@ func TestFinalReply_OnlyAfterVisibleTerminalDelivery(t *testing.T) {
 			state := &interactiveState{agentSession: sess, platform: p, replyCtx: "requester"}
 			sess.events <- Event{Type: EventResult, Content: "compaction", Done: false}
 			sess.events <- Event{Type: EventResult, Content: tc.response, Done: true}
-			e.processInteractiveEvents(state, session, e.sessions, "test:requester", "", time.Now(), nil, nil, "requester")
+			e.processInteractiveEvents(state, session, e.sessions, "test:requester", "", time.Now(), nil, nil, "requester", 0)
 			sent := p.getSent()
 			if got := len(completionMentions(sent)); got != tc.wantMentions {
 				t.Fatalf("mentions=%d, want %d; sent=%v", got, tc.wantMentions, sent)
@@ -103,7 +103,7 @@ func TestFinalReply_StoppedTurnDoesNotNotify(t *testing.T) {
 	state := &interactiveState{agentSession: newControllableSession("stopped"), platform: p, replyCtx: "requester"}
 	state.markStopped()
 	session := e.sessions.GetOrCreateActive("test:requester")
-	e.processInteractiveEvents(state, session, e.sessions, "test:requester", "", time.Now(), nil, nil, "requester")
+	e.processInteractiveEvents(state, session, e.sessions, "test:requester", "", time.Now(), nil, nil, "requester", 0)
 	if got := completionMentions(p.getSent()); len(got) != 0 {
 		t.Fatalf("stopped turn notified completion: %v", got)
 	}
@@ -133,7 +133,7 @@ func TestFinalReply_StreamingCardFinalizesBeforeNotification(t *testing.T) {
 	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "requester"}
 	session := e.sessions.GetOrCreateActive("test:requester")
 	sess.events <- Event{Type: EventResult, Content: "Finished", Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, "test:requester", "", time.Now(), nil, nil, "requester")
+	e.processInteractiveEvents(state, session, e.sessions, "test:requester", "", time.Now(), nil, nil, "requester", 0)
 	sent := p.getSent()
 	if len(sent) != 2 || !strings.Contains(sent[0], "final card: ") || !strings.HasPrefix(sent[1], "@requester ") {
 		t.Fatalf("expected finalized card before native notification, got %v", sent)

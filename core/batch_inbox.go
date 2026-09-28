@@ -279,13 +279,14 @@ func (e *Engine) runBatchInbox() {
 		return
 	}
 	session := e.sessions.GetOrCreateActive(b.cfg.SessionKey)
-	if !session.TryLock() {
+	lockGen, locked := session.TryLock()
+	if !locked {
 		return
 	}
 	b.mu.Lock()
 	if b.running || b.disk.Paused || len(b.disk.Pending) == 0 {
 		b.mu.Unlock()
-		session.UnlockWithoutUpdate()
+		session.UnlockWithoutUpdate(lockGen)
 		return
 	}
 	// Atomically drain ALL pending records after acquiring the agent session.
@@ -297,7 +298,7 @@ func (e *Engine) runBatchInbox() {
 		b.disk.InFlight = nil
 		b.running = false
 		b.mu.Unlock()
-		session.UnlockWithoutUpdate()
+		session.UnlockWithoutUpdate(lockGen)
 		slog.Error("batch drain save failed", "error", err)
 		return
 	}
@@ -311,7 +312,7 @@ func (e *Engine) runBatchInbox() {
 	data, _ := json.MarshalIndent(batch, "", "  ")
 	batchPath := strings.TrimSuffix(b.path, ".json") + "-current.json"
 	if err = os.WriteFile(batchPath, data, 0600); err != nil {
-		session.UnlockWithoutUpdate()
+		session.UnlockWithoutUpdate(lockGen)
 		b.finish(false)
 		return
 	}
@@ -325,7 +326,7 @@ func (e *Engine) runBatchInbox() {
 		previous.mu.Unlock()
 	}
 	e.interactiveMu.Unlock()
-	e.processInteractiveMessage(p, msg, session)
+	e.processInteractiveMessage(p, msg, session, lockGen)
 	e.interactiveMu.Lock()
 	state := e.interactiveStates[b.cfg.SessionKey]
 	e.interactiveMu.Unlock()
