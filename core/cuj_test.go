@@ -1127,6 +1127,7 @@ func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	defer e.Stop()
 
 	msg := &Message{
 		SessionKey: "test:img", Platform: "test", MessageID: "img1",
@@ -1152,6 +1153,12 @@ func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+	// Session creation precedes the asynchronous history save. Wait for the
+	// turn to release its lock before t.TempDir removes the session directory.
+	env := &cujEnv{t: t, engine: e, plat: plat, agent: agent}
+	env.waitFor("image turn completion", 2*time.Second, func() bool {
+		return !e.sessions.GetOrCreateActive(msg.SessionKey).Busy()
+	})
 }
 
 // CUJ-A4 · User sends voice → without STT configured, user gets a clear
@@ -1191,6 +1198,7 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	defer e.Stop()
 
 	msg := &Message{
 		SessionKey: "test:file", Platform: "test", MessageID: "f1",
@@ -1207,7 +1215,7 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 		n := len(agent.sessions)
 		agent.mu.Unlock()
 		if n > 0 {
-			return
+			break
 		}
 		select {
 		case <-deadline:
@@ -1216,6 +1224,10 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+	env := &cujEnv{t: t, engine: e, plat: plat, agent: agent}
+	env.waitFor("file turn completion", 2*time.Second, func() bool {
+		return !e.sessions.GetOrCreateActive(msg.SessionKey).Busy()
+	})
 }
 
 // CUJ-A6 / A7 are intentionally covered at the platform layer
