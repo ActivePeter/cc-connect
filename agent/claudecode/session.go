@@ -976,6 +976,12 @@ func (cs *claudeSession) handleControlRequest(raw map[string]any) {
 	}
 }
 
+// SendMidTurn uses Claude Code's stream-json input to fold a user message into
+// the current turn at the next tool boundary, using the same attachment format.
+func (cs *claudeSession) SendMidTurn(prompt, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
+	return cs.Send(prompt, messageID, images, files)
+}
+
 // Send writes a user message (with optional images and files) to the Claude process stdin.
 // Images are sent as base64 in the multimodal content array.
 // Files are saved to local temp files and referenced in the text prompt

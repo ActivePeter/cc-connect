@@ -558,6 +558,7 @@ type interactiveState struct {
 	stopped                  bool
 	pending                  *pendingPermission
 	pendingMessages          []queuedMessage // messages queued while session was busy
+	midTurnReady             bool            // first input written; cleared before processing a terminal result
 	approveAll               bool            // when true, auto-approve all permission requests for this session
 	fromVoice                bool            // true if current turn originated from voice transcription
 	sideText                 string
@@ -3215,6 +3216,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			}
 		}
 		// ── end self-heal; queueing path below is unchanged ────────────────
+		if e.injectUserMessageForBusySession(p, msg, interactiveKey, session, sessions) {
+			return
+		}
 		// Session is busy — try to queue the message for the running turn
 		// so the agent processes it immediately after the current turn ends.
 		if e.queueMessageForBusySession(p, msg, interactiveKey) {
@@ -4021,7 +4025,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			sendDone <- fmt.Errorf("agent session became nil")
 			return
 		}
-		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
+		sendDone <- sendForegroundMessage(state, as, promptContent, msg.MessageID, msg.Images, msg.Files)
 	}()
 
 	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
@@ -5136,6 +5140,11 @@ var agentErrorHandlers = []agentErrorHandler{
 }
 
 func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) {
+	defer func() {
+		state.mu.Lock()
+		state.midTurnReady = false
+		state.mu.Unlock()
+	}()
 	input := ""
 	for _, h := range session.GetHistory(1) {
 		if h.Role == "user" {
@@ -5919,6 +5928,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				)
 				continue
 			}
+			state.mu.Lock()
+			state.midTurnReady = false
+			state.mu.Unlock()
 			cp.Finalize(ProgressCardStateCompleted)
 			// Use state.agentSession.CurrentSessionID() instead of event.SessionID.
 			// event.SessionID may be empty in some cases, causing the agent_session_id
@@ -6348,7 +6360,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						nextSend <- fmt.Errorf("agent session became nil")
 						return
 					}
-					nextSend <- as.Send(queuedPrompt, queued.messageID, queued.images, queued.files)
+					nextSend <- sendForegroundMessage(state, as, queuedPrompt, queued.messageID, queued.images, queued.files)
 				}()
 				pendingSend = nextSend
 
@@ -6676,7 +6688,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 				sendDone <- fmt.Errorf("agent session became nil")
 				return
 			}
-			sendDone <- as.Send(prompt, queued.messageID, queued.images, queued.files)
+			sendDone <- sendForegroundMessage(state, as, prompt, queued.messageID, queued.images, queued.files)
 		}()
 
 		var stopTyping func()

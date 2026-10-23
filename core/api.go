@@ -90,6 +90,7 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 		maxAttachmentBytes: DefaultMaxAttachmentSize,
 	}
 	s.mux.HandleFunc("/send", s.handleSend)
+	s.mux.HandleFunc("/inject", s.handleInject)
 	s.mux.HandleFunc("/sessions", s.handleSessions)
 	s.mux.HandleFunc("/batch/status", s.handleBatch)
 	s.mux.HandleFunc("/batch/enqueue", s.handleBatch)
