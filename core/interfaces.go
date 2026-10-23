@@ -426,6 +426,14 @@ type AgentSession interface {
 	Close() error
 }
 
+// MidTurnMessageSender is an optional capability for sessions whose input can
+// be incorporated into a running turn without requiring an additional result.
+// Both Send and SendMidTurn must return after writing the input, not wait for
+// the agent turn to finish. The engine serializes writes with turn completion.
+type MidTurnMessageSender interface {
+	SendMidTurn(prompt, messageID string, images []ImageAttachment, files []FileAttachment) error
+}
+
 // PermissionResult represents the user's decision on a permission request.
 type PermissionResult struct {
 	Behavior     string         `json:"behavior"`               // "allow" or "deny"

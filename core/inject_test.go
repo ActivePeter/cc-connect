@@ -17,6 +17,12 @@ func (s *injectRecordingSession) Send(p string, _ string, _ []ImageAttachment, _
 }
 func (s *injectRecordingSession) Alive() bool { return !s.dead }
 
+type midTurnRecordingSession struct{ injectRecordingSession }
+
+func (s *midTurnRecordingSession) SendMidTurn(p, id string, images []ImageAttachment, files []FileAttachment) error {
+	return s.Send(p, id, images, files)
+}
+
 type namedStubAgent struct {
 	stubAgent
 	name string
@@ -26,8 +32,8 @@ func (a *namedStubAgent) Name() string { return a.name }
 
 func TestInjectIdleSessionWritesNothing(t *testing.T) {
 	e := newTestEngine()
-	rec := &injectRecordingSession{}
-	e.interactiveStates["s1"] = &interactiveState{agentSession: rec, agent: &namedStubAgent{name: "claudecode"}}
+	rec := &midTurnRecordingSession{}
+	e.interactiveStates["s1"] = &interactiveState{agentSession: rec, midTurnReady: true}
 	got, err := e.InjectToBusySession("s1", "hello")
 	if err != nil || got != InjectIdle {
 		t.Fatalf("idle session: got %q, %v; want idle", got, err)
@@ -43,8 +49,8 @@ func TestInjectIdleSessionWritesNothing(t *testing.T) {
 
 func TestInjectBusySessionWritesToAgent(t *testing.T) {
 	e := newTestEngine()
-	rec := &injectRecordingSession{}
-	e.interactiveStates["s1"] = &interactiveState{agentSession: rec, agent: &namedStubAgent{name: "claudecode"}}
+	rec := &midTurnRecordingSession{}
+	e.interactiveStates["s1"] = &interactiveState{agentSession: rec, midTurnReady: true}
 	sess := e.sessions.GetOrCreateActive("s1")
 	if !sess.TryLock() {
 		t.Fatal("lock")
@@ -61,8 +67,8 @@ func TestInjectBusySessionWritesToAgent(t *testing.T) {
 
 func TestInjectBusyButNoLiveAgentIsIdle(t *testing.T) {
 	e := newTestEngine()
-	rec := &injectRecordingSession{dead: true}
-	e.interactiveStates["s1"] = &interactiveState{agentSession: rec, agent: &namedStubAgent{name: "claudecode"}}
+	rec := &midTurnRecordingSession{injectRecordingSession: injectRecordingSession{dead: true}}
+	e.interactiveStates["s1"] = &interactiveState{agentSession: rec, midTurnReady: true}
 	sess := e.sessions.GetOrCreateActive("s1")
 	sess.TryLock()
 	defer sess.UnlockWithoutUpdate()

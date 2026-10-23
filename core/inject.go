@@ -56,21 +56,95 @@ func (e *Engine) InjectToBusySession(sessionKey, prompt string) (string, error) 
 	}
 
 	state.mu.Lock()
-	agentSession := state.agentSession
-	agent := state.agent
+	status, err := injectIntoStateLocked(state, prompt, "", nil, nil)
 	state.mu.Unlock()
-	if agentSession == nil || !agentSession.Alive() {
-		// Busy but the agent is still starting (or just died): nothing to
-		// write into yet. Report idle so the caller retries through the
-		// normal path, which queues or starts a turn.
-		return InjectIdle, nil
-	}
-	if agent != nil && agent.Name() != "claudecode" {
-		return "", ErrInjectUnsupported
-	}
-	if err := agentSession.Send(prompt, "", nil, nil); err != nil {
-		return "", fmt.Errorf("inject: %w", err)
+	if err != nil || status != InjectInjected {
+		return status, err
 	}
 	slog.Info("message injected into running turn", "session", sessionKey, "interactive_key", iKey, "len", len(prompt))
 	return InjectInjected, nil
+}
+
+// injectIntoStateLocked shares the mid-turn transport between API notifications
+// and platform messages. state.mu excludes terminal-result handling and the
+// first Send, so an interjection cannot overtake the turn's initial prompt.
+func injectIntoStateLocked(state *interactiveState, prompt, messageID string, images []ImageAttachment, files []FileAttachment) (string, error) {
+	if state.stopped || state.agentSession == nil || !state.agentSession.Alive() {
+		return InjectIdle, nil
+	}
+	sender, ok := state.agentSession.(MidTurnMessageSender)
+	if !ok {
+		return "", ErrInjectUnsupported
+	}
+	if !state.midTurnReady {
+		return InjectIdle, nil
+	}
+	if err := sender.SendMidTurn(prompt, messageID, images, files); err != nil {
+		return "", fmt.Errorf("inject: %w", err)
+	}
+	return InjectInjected, nil
+}
+
+// sendForegroundMessage arms injection only after the initial input has been
+// written. Agents whose Send blocks for an entire turn never take this lock.
+func sendForegroundMessage(state *interactiveState, as AgentSession, prompt, messageID string, images []ImageAttachment, files []FileAttachment) error {
+	if _, ok := as.(MidTurnMessageSender); !ok {
+		return as.Send(prompt, messageID, images, files)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.stopped || state.agentSession != as {
+		return fmt.Errorf("agent session ended before send")
+	}
+	err := as.Send(prompt, messageID, images, files)
+	state.midTurnReady = err == nil
+	return err
+}
+
+// injectUserMessageForBusySession accepts a platform message into the current
+// turn without adding a queued turn or waiting for an extra result. Callers
+// retain the normal queue/retry path whenever delivery is unavailable or fails.
+func (e *Engine) injectUserMessageForBusySession(p Platform, msg *Message, key string, session *Session, sessions *SessionManager) bool {
+	if msg.ModeOverride != "" {
+		return false // per-turn permission overrides need their own turn
+	}
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[key]
+	if state == nil {
+		e.interactiveMu.Unlock()
+		return false
+	}
+	state.mu.Lock()
+	e.interactiveMu.Unlock()
+	// Do not overtake inputs queued during startup or after a failed write.
+	if len(state.pendingMessages) > 0 {
+		state.mu.Unlock()
+		return false
+	}
+	if e.isStaleUserMessageLocked(state, msg.UserMessageTimeMs) {
+		snap := userMessageWatermarkSnapshotLocked(state)
+		state.mu.Unlock()
+		e.logStaleUserMessageDropped("reject_before_inject", msg, key, snap)
+		return true
+	}
+	prompt := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+	status, err := injectIntoStateLocked(state, prompt, msg.MessageID, msg.Images, msg.Files)
+	if err != nil || status != InjectInjected {
+		state.mu.Unlock()
+		if err != nil && !errors.Is(err, ErrInjectUnsupported) {
+			slog.Warn("user message injection failed; falling back to queue", "session", msg.SessionKey, "msg_id", msg.MessageID, "error", err)
+		}
+		return false
+	}
+	session.AddHistory("user", msg.Content)
+	session.TouchUserActivity()
+	if msg.UserMessageTimeMs > state.currentTurnUserMessageTimeMs {
+		state.currentTurnUserMessageTimeMs = msg.UserMessageTimeMs
+	}
+	state.mu.Unlock()
+	sessions.Save()
+	runMessageAccepted(msg)
+	slog.Info("user message injected into running turn", "session", msg.SessionKey, "interactive_key", key, "msg_id", msg.MessageID)
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageInjected))
+	return true
 }

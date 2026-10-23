@@ -2455,3 +2455,50 @@ func TestCUJ_N1_CompletionMentionsFollowQueuedRequesters(t *testing.T) {
 		}
 	}
 }
+
+// A user starts a task, then sends two corrections before it finishes. Both
+// corrections must be acknowledged immediately, and one result must release
+// the turn so that a subsequent request can run normally.
+func TestCUJ_N2_UserMessagesInterjectIntoRunningTurn(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	as := &userInjectSession{queuingAgentSession: newQueuingSession("live")}
+	e := NewEngine("test", &controllableAgent{nextSession: as}, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+	defer e.Stop()
+	key := "test:room:user"
+	send := func(id, content string) {
+		e.ReceiveMessage(p, &Message{SessionKey: key, Platform: "test", MessageID: id, UserID: "user", Content: content, ReplyCtx: id})
+	}
+	send("first", "start a long task")
+	waitForInterjectionReady(t, e, key)
+	send("second", "use the updated plan")
+	send("third", "also keep the existing files")
+	got := p.getSent()
+	if len(got) != 2 || got[0] != e.i18n.T(MsgMessageInjected) || got[1] != e.i18n.T(MsgMessageInjected) {
+		t.Fatalf("corrections were not acknowledged during the task: %v", got)
+	}
+	as.sendMu.Lock()
+	prompts := append([]string(nil), as.sendCalls...)
+	as.sendMu.Unlock()
+	if len(prompts) != 3 || prompts[1] != "use the updated plan" || prompts[2] != "also keep the existing files" {
+		t.Fatalf("running task did not receive corrections in order: %v", prompts)
+	}
+	as.events <- Event{Type: EventResult, Content: "Finished using both corrections", Done: true}
+	session := e.sessions.GetOrCreateActive(key)
+	env := &cujEnv{t: t, engine: e, plat: p}
+	env.waitFor("single combined result", 3*time.Second, func() bool { return env.sentContains("Finished using both corrections") })
+	env.waitFor("turn lock released after one result", 3*time.Second, func() bool {
+		if session.TryLock() {
+			session.UnlockWithoutUpdate()
+			return true
+		}
+		return false
+	})
+	history := session.GetHistory(10)
+	if len(history) != 4 || history[0].Role != "user" || history[1].Content != prompts[1] || history[2].Content != prompts[2] || history[3].Role != "assistant" {
+		t.Fatalf("conversation history lost or duplicated a correction: %v", history)
+	}
+	send("fourth", "start the next task")
+	waitForInterjectionReady(t, e, key)
+	as.events <- Event{Type: EventResult, Content: "Next task finished", Done: true}
+	env.waitFor("next normal request completes", 3*time.Second, func() bool { return env.sentContains("Next task finished") })
+}
