@@ -198,3 +198,21 @@ func waitFor(t *testing.T, cond func() bool, timeout time.Duration) {
 	}
 	t.Fatal("condition not met in time")
 }
+
+// /goal <condition> must not fire while a foreground turn is in flight:
+// goal/set starts its own turn, and the two event streams would mix.
+func TestCmdGoalRejectedWhileTurnRunning(t *testing.T) {
+	e, p, as, key := newGoalEngine(t)
+	session := e.sessions.GetOrCreateActive(key)
+	if !session.TryLock() {
+		t.Fatal("lock")
+	}
+	sendText(e, p, key, "/goal make tests pass")
+	if _, _, sets := as.state(); sets != 0 {
+		t.Fatalf("sets = %d while a turn was running", sets)
+	}
+	if got := p.getSent(); len(got) != 1 || !strings.Contains(got[0], "还在跑") {
+		t.Fatalf("reply = %#v", got)
+	}
+	session.UnlockWithoutUpdate()
+}

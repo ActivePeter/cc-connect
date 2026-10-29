@@ -6477,7 +6477,7 @@ func (e *Engine) blockMessageForActiveGoal(p Platform, msg *Message, interactive
 // when the text should go to the agent verbatim (agents with a native /goal,
 // e.g. Claude Code).
 func (e *Engine) cmdGoal(p Platform, msg *Message, args []string) bool {
-	agent, _, interactiveKey, err := e.commandContext(p, msg)
+	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return true
@@ -6511,6 +6511,12 @@ func (e *Engine) cmdGoal(p Platform, msg *Message, args []string) bool {
 		}
 		e.reply(p, msg.ReplyCtx, "goal 已清除。")
 	default:
+		// goal/set starts its own turn; issuing it while a foreground turn is
+		// running would mix the two event streams. Status and clear are safe.
+		if sessions.GetOrCreateActive(msg.SessionKey).Busy() {
+			e.reply(p, msg.ReplyCtx, "当前这一轮还在跑，等它结束再发 /goal 条件。")
+			return true
+		}
 		info, err := gc.SetGoal(arg)
 		if err != nil {
 			slog.Error("goal: set failed", "session", msg.SessionKey, "error", err)
