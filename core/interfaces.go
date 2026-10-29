@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -433,6 +434,34 @@ type AgentSession interface {
 type MidTurnMessageSender interface {
 	SendMidTurn(prompt, messageID string, images []ImageAttachment, files []FileAttachment) error
 }
+
+// GoalInfo is a snapshot of a session-scoped native goal.
+type GoalInfo struct {
+	Objective  string
+	Status     string // codex: active|paused|blocked|usageLimited|budgetLimited|complete
+	TokensUsed int64
+}
+
+// Active reports whether the goal is still being pursued.
+func (g GoalInfo) Active() bool { return strings.EqualFold(g.Status, "active") }
+
+// GoalController is an optional session capability behind /goal. SetGoal
+// starts the agent's first work turn on its own and must not block until the
+// goal finishes; GetGoal is a cache read with no round-trip.
+type GoalController interface {
+	SetGoal(objective string) (GoalInfo, error)
+	GetGoal() GoalInfo
+	ClearGoal() error
+}
+
+// GoalAwareAgent marks agents whose sessions can carry a goal, so /goal can
+// tell "no goal mode, deliver the text to the agent" (Claude Code) from
+// "goal mode, but no live session yet" (codex app-server).
+type GoalAwareAgent interface{ SupportsGoalMode() bool }
+
+// EventGoal is a one-line goal notice (started, achieved, paused, cleared).
+// It is relayed as its own message and never ends a turn.
+const EventGoal EventType = "goal"
 
 // PermissionResult represents the user's decision on a permission request.
 type PermissionResult struct {

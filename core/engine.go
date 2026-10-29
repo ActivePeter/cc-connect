@@ -3017,6 +3017,13 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		return
 	}
 
+	// A goal that is still being pursued owns the session: answer the message
+	// without handing it to the agent. Commands (including /goal and /stop)
+	// were already handled above.
+	if e.blockMessageForActiveGoal(p, msg, interactiveKey) {
+		return
+	}
+
 	session := sessions.GetOrCreateActive(msg.SessionKey)
 	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
 	// Ensure an interactiveState entry exists before taking the session lock.
@@ -4623,6 +4630,15 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 			state.mu.Unlock()
 
 			switch event.Type {
+			case EventGoal:
+				// Goal notices (achieved, paused, ...) are relayed as their own
+				// message; they are not part of textParts and never close a turn.
+				if strings.TrimSpace(event.Content) != "" {
+					if err := e.sendWithError(p, replyCtx, event.Content); err != nil {
+						slog.Debug("unsolicited goal notice send failed", "error", err)
+					}
+				}
+
 			case EventText:
 				if event.Content != "" {
 					textParts = append(textParts, event.Content)
@@ -5038,6 +5054,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 
 		switch event.Type {
+		case EventGoal:
+			// Goal lifecycle notices are their own short message; they never
+			// belong to the turn's reply text and do not end the turn.
+			if strings.TrimSpace(event.Content) != "" {
+				e.send(p, replyCtx, event.Content)
+			}
 		case EventThinking:
 			if isEllipsisOnly(event.Content) {
 				break
@@ -6355,6 +6377,7 @@ var builtinCommands = []struct {
 	{[]string{"cron"}, "cron"},
 	{[]string{"timer", "at", "remind"}, "timer"},
 	{[]string{"heartbeat", "hb"}, "heartbeat"},
+	{[]string{"goal"}, "goal"},
 	{[]string{"compress", "compact"}, "compress"},
 	{[]string{"stop"}, "stop"},
 	{[]string{"cancel"}, "cancel"},
@@ -6410,6 +6433,93 @@ func (e *Engine) cmdPs(p Platform, msg *Message, args []string) {
 		return
 	}
 	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSent))
+}
+
+// ── /goal ──────────────────────────────────────────────────────
+
+// liveGoalController returns the goal capability of the live session for
+// interactiveKey, or nil. GetGoal is a cache read, so this is cheap enough
+// for the message path.
+func (e *Engine) liveGoalController(interactiveKey string) GoalController {
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[interactiveKey]
+	e.interactiveMu.Unlock()
+	if state == nil {
+		return nil
+	}
+	state.mu.Lock()
+	as := state.agentSession
+	state.mu.Unlock()
+	if as == nil || !as.Alive() {
+		return nil
+	}
+	gc, _ := as.(GoalController)
+	return gc
+}
+
+// blockMessageForActiveGoal answers an ordinary message without handing it to
+// the agent while a goal is still running. Codex starts its next goal round
+// milliseconds after a turn ends, so there is no window to queue into safely.
+func (e *Engine) blockMessageForActiveGoal(p Platform, msg *Message, interactiveKey string) bool {
+	gc := e.liveGoalController(interactiveKey)
+	if gc == nil {
+		return false
+	}
+	info := gc.GetGoal()
+	if !info.Active() {
+		return false
+	}
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf("goal 进行中：%s\n等它达成，或先发 /goal clear，再发新消息。", info.Objective))
+	return true
+}
+
+// cmdGoal handles /goal, /goal <condition> and /goal clear. Returns false
+// when the text should go to the agent verbatim (agents with a native /goal,
+// e.g. Claude Code).
+func (e *Engine) cmdGoal(p Platform, msg *Message, args []string) bool {
+	agent, _, interactiveKey, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return true
+	}
+	gc := e.liveGoalController(interactiveKey)
+	if gc == nil {
+		if ga, ok := agent.(GoalAwareAgent); ok && ga.SupportsGoalMode() {
+			e.reply(p, msg.ReplyCtx, "当前没有运行中的会话，goal 要等会话启动后才能设置。先发一条消息，再发 /goal 条件。")
+			return true
+		}
+		return false
+	}
+	arg := strings.TrimSpace(strings.Join(args, " "))
+	switch {
+	case arg == "":
+		info := gc.GetGoal()
+		if info.Objective == "" {
+			e.reply(p, msg.ReplyCtx, "当前没有 goal。用法：/goal 完成条件")
+			return true
+		}
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("goal：%s\n状态：%s\n已用 token：%d", info.Objective, info.Status, info.TokensUsed))
+	case strings.EqualFold(arg, "clear"):
+		if gc.GetGoal().Objective == "" {
+			e.reply(p, msg.ReplyCtx, "当前没有 goal。")
+			return true
+		}
+		if err := gc.ClearGoal(); err != nil {
+			slog.Error("goal: clear failed", "session", msg.SessionKey, "error", err)
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("清除 goal 失败：%v", err))
+			return true
+		}
+		e.reply(p, msg.ReplyCtx, "goal 已清除。")
+	default:
+		info, err := gc.SetGoal(arg)
+		if err != nil {
+			slog.Error("goal: set failed", "session", msg.SessionKey, "error", err)
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("设置 goal 失败：%v", err))
+			return true
+		}
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("goal 已设置（%s）：%s\n达成或要停止时发 /goal clear。", info.Status, info.Objective))
+	}
+	return true
 }
 
 // matchPrefix finds a unique command matching the given prefix.
@@ -6573,6 +6683,13 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdTimer(p, msg, args)
 	case "heartbeat":
 		e.cmdHeartbeat(p, msg, args)
+	case "goal":
+		if !e.cmdGoal(p, msg, args) {
+			// Agent has no native goal command of its own either (e.g. Claude
+			// Code has one): fall through and deliver the raw text as a normal
+			// user message instead of answering "unknown command".
+			return false
+		}
 	case "compress":
 		e.cmdCompress(p, msg)
 	case "stop":
