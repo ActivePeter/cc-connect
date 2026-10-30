@@ -75,8 +75,11 @@ const (
 )
 
 const (
-	replyFooterUsageTimeout  = 1500 * time.Millisecond
 	replyFooterUsageCacheTTL = 30 * time.Second
+	// replyFooterUsageProbeTimeout bounds the background usage refresh. It is
+	// deliberately larger than the old inline budget: the refresh no longer
+	// blocks a turn, so a slow probe is harmless.
+	replyFooterUsageProbeTimeout = 10 * time.Second
 )
 
 const (
@@ -466,6 +469,7 @@ type Engine struct {
 	stopping            bool
 	replyFooterMu       sync.Mutex
 	replyFooterUsage    replyFooterUsageCache
+	replyFooterRefresh  atomic.Bool // single-flight guard for the background refresh
 
 	// pendingRestartNotify is queued at startup if a /restart was consumed
 	// from the run/restart_notify file. It is dispatched on the first
@@ -7562,41 +7566,53 @@ func replyFooterReasoningEffort(session AgentSession, agent Agent) string {
 	return ""
 }
 
+// replyFooterUsageText serves the cached usage text; it never probes here,
+// because a stuck probe would leave the turn unfinished (claude /usage pty).
 func (e *Engine) replyFooterUsageText(session AgentSession, agent Agent) string {
-	ctx, cancel := context.WithTimeout(e.ctx, replyFooterUsageTimeout)
-	defer cancel()
-
-	if session != nil {
-		if reporter, ok := session.(UsageReporter); ok {
-			if report, err := reporter.GetUsage(ctx); err == nil {
-				return formatReplyFooterUsage(report, e.i18n)
-			}
-		}
-	}
-
-	reporter, ok := agent.(UsageReporter)
-	if !ok {
-		return ""
-	}
-
 	e.replyFooterMu.Lock()
 	cached := e.replyFooterUsage
 	e.replyFooterMu.Unlock()
-	if !cached.fetchedAt.IsZero() && time.Since(cached.fetchedAt) < replyFooterUsageCacheTTL {
-		return cached.text
+	if cached.fetchedAt.IsZero() || time.Since(cached.fetchedAt) >= replyFooterUsageCacheTTL {
+		e.refreshReplyFooterUsage(session, agent)
 	}
+	return cached.text
+}
 
-	text := ""
-	if report, err := reporter.GetUsage(ctx); err == nil {
-		text = formatReplyFooterUsage(report, e.i18n)
-	} else if !cached.fetchedAt.IsZero() {
-		text = cached.text
+// refreshReplyFooterUsage starts at most one background usage probe; a failed
+// probe keeps the old text and still stamps fetchedAt to avoid per-turn churn.
+func (e *Engine) refreshReplyFooterUsage(session AgentSession, agent Agent) {
+	if !e.replyFooterRefresh.CompareAndSwap(false, true) {
+		return
 	}
+	go func() {
+		defer e.replyFooterRefresh.Store(false)
+		ctx, cancel := context.WithTimeout(e.ctx, replyFooterUsageProbeTimeout)
+		defer cancel()
 
-	e.replyFooterMu.Lock()
-	e.replyFooterUsage = replyFooterUsageCache{text: text, fetchedAt: time.Now()}
-	e.replyFooterMu.Unlock()
-	return text
+		text := ""
+		if session != nil {
+			if reporter, ok := session.(UsageReporter); ok {
+				if report, err := reporter.GetUsage(ctx); err == nil {
+					text = formatReplyFooterUsage(report, e.i18n)
+				}
+			}
+		}
+		if text == "" {
+			if reporter, ok := agent.(UsageReporter); ok {
+				if report, err := reporter.GetUsage(ctx); err == nil {
+					text = formatReplyFooterUsage(report, e.i18n)
+				}
+			}
+		}
+
+		e.replyFooterMu.Lock()
+		if text == "" {
+			e.replyFooterUsage.fetchedAt = time.Now()
+		} else {
+			e.replyFooterUsage = replyFooterUsageCache{text: text, fetchedAt: time.Now()}
+		}
+		e.replyFooterMu.Unlock()
+	}()
 }
 
 func formatReplyFooterUsage(report *UsageReport, i18n *I18n) string {

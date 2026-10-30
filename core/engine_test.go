@@ -1279,6 +1279,19 @@ func TestProcessInteractiveEvents_AppendsReplyFooterWhenEnabled(t *testing.T) {
 	}
 	e.interactiveStates[sessionKey] = state
 
+	// Usage is refreshed in the background (never on the turn-completion
+	// path), so warm the cache before the turn like a previous turn would.
+	e.refreshReplyFooterUsage(nil, agent)
+	for i := 0; i < 200; i++ {
+		e.replyFooterMu.Lock()
+		ready := !e.replyFooterUsage.fetchedAt.IsZero()
+		e.replyFooterMu.Unlock()
+		if ready {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	agentSession.events <- Event{Type: EventResult, Content: "answer", Done: true}
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-footer", time.Now(), nil, nil, state.replyCtx)
 
