@@ -30,6 +30,9 @@ const (
 	// pty reader. A blocked Read on a pty master cannot be interrupted by
 	// Close on Linux, so the wait must never be unbounded.
 	claudeUsageReaderWait = 2 * time.Second
+	// claudeUsageWaitDelay bounds cmd.Wait when an escaped descendant still
+	// holds the stderr pipe: exec closes the pipe after this delay.
+	claudeUsageWaitDelay = 2 * time.Second
 )
 
 var (
@@ -79,6 +82,7 @@ func (a *Agent) runClaudeUsageProbe(ctx context.Context) (string, error) {
 	}
 	cmd := exec.CommandContext(probeCtx, "claude", args...)
 	cmd.Dir = workDir
+	cmd.WaitDelay = claudeUsageWaitDelay
 
 	env := filterEnv(os.Environ(), "CLAUDECODE")
 	env = append(env, "DISABLE_TELEMETRY=true")
@@ -210,7 +214,7 @@ func finishClaudeUsageProbe(ptmx *os.File, cmd *exec.Cmd, readDone <-chan error,
 	select {
 	case <-processDone:
 	case <-time.After(claudeUsageReaderWait):
-		<-processDone
+		slog.Warn("claudeSession: usage probe process did not exit in time")
 	}
 }
 
