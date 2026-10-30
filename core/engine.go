@@ -3038,16 +3038,16 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	}
 	if msg.goalObjective {
 		if len(msg.Images) > 0 || len(msg.Files) > 0 {
-			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgGoalNoFiles))
+			e.reply(p, msg.ReplyCtx, "goal 模式目前只支持文字，请发送不带附件的文字目标。")
 			return
 		}
 		if gc := e.liveGoalController(interactiveKey); gc != nil {
 			if gc.GetGoal().Active() {
-				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgGoalActiveReject))
+				e.reply(p, msg.ReplyCtx, "当前 goal 还在执行，先发 /goal clear 再设新目标。")
 				return
 			}
 			if running, ok := gc.(GoalTurnRunning); ok && running.GoalTurnRunning() && !sessions.GetOrCreateActive(msg.SessionKey).Busy() {
-				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgGoalRetry))
+				e.reply(p, msg.ReplyCtx, "没能开始，请重发。")
 				return
 			}
 		}
@@ -3275,7 +3275,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		"queue_depth", queueDepth,
 	)
 	if msg.goalObjective {
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgGoalQueued))
+		e.reply(p, msg.ReplyCtx, "这一轮结束后开始执行 goal。")
 	} else {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
 	}
@@ -4073,7 +4073,8 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 // When agentOverride is non-nil it is used instead of e.agent to start the session.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
 // A goal query must preserve the saved ID and report resume failure instead of starting a new thread.
-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, goalQuery ...bool) *interactiveState {
+func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, q ...bool) *interactiveState {
+	goalQuery := len(q) > 0 && q[0]
 	e.interactiveMu.Lock()
 	defer e.interactiveMu.Unlock()
 
@@ -4181,7 +4182,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// resume a conversation that has nothing to do with this project.
 	if startSessionID != "" {
 		if validator, ok := agent.(SessionIDValidator); ok && !validator.ValidateSessionID(e.ctx, startSessionID) {
-			if len(goalQuery) > 0 && goalQuery[0] {
+			if goalQuery {
 				state := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true}
 				adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], state)
 				e.interactiveStates[sessionKey] = state
@@ -4197,14 +4198,14 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	isResume := startSessionID != ""
 	startAt := time.Now()
 	startCtx := e.ctx
-	if len(goalQuery) > 0 && goalQuery[0] {
+	if goalQuery {
 		startCtx = GoalQueryContext(startCtx)
 	}
 	agentSession, err := agent.StartSession(startCtx, startSessionID)
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		// If resume/continue failed, try a fresh session as fallback.
-		if startSessionID != "" && (len(goalQuery) == 0 || !goalQuery[0]) {
+		if startSessionID != "" && !goalQuery {
 			slog.Error("session resume failed, falling back to fresh session",
 				"session_key", sessionKey, "failed_session_id", startSessionID,
 				"error", err, "elapsed", startElapsed)
@@ -4996,7 +4997,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.mu.Lock()
 				p := state.platform
 				state.mu.Unlock()
-				e.reply(p, replyCtx, e.i18n.T(MsgGoalRetry))
+				e.reply(p, replyCtx, "没能开始，请重发。")
 				return
 			}
 			if err != nil {
@@ -6598,7 +6599,7 @@ func (e *Engine) sendGoal(as AgentSession, objective string, p Platform, replyCt
 	}
 	if notice, ok := as.(GoalResumeNotice); ok {
 		if old := notice.GoalResumeNotice(); old != "" {
-			if err := e.replyWithError(p, replyCtx, e.i18n.Tf(MsgGoalResumeNotice, old)); err != nil {
+			if err := e.replyWithError(p, replyCtx, fmt.Sprintf("上次的 goal 已在重启时清除（%s）。", old)); err != nil {
 				return err
 			}
 			notice.AckGoalResumeNotice(old)
@@ -6679,7 +6680,7 @@ func (e *Engine) cmdGoal(p Platform, msg *Message, args []string) bool {
 		old = notice.GoalResumeNotice()
 	}
 	if arg == "" && old != "" {
-		if e.replyWithError(p, msg.ReplyCtx, e.i18n.Tf(MsgGoalResumeNone, old)) == nil {
+		if e.replyWithError(p, msg.ReplyCtx, fmt.Sprintf("当前没有 goal（上次的已在重启时清除：%s）。", old)) == nil {
 			notice.AckGoalResumeNotice(old)
 		}
 		return true
@@ -6715,15 +6716,15 @@ func (e *Engine) cmdGoal(p Platform, msg *Message, args []string) bool {
 		}
 		if gc.GetGoal().Objective == "" {
 			if old != "" {
-				reply := e.i18n.Tf(MsgGoalResumeNone, old)
+				reply := fmt.Sprintf("当前没有 goal（上次的已在重启时清除：%s）。", old)
 				if canceled {
-					reply += " " + e.i18n.T(MsgGoalCanceled)
+					reply += " 排队的 goal 已取消。"
 				}
 				if e.replyWithError(p, msg.ReplyCtx, reply) == nil {
 					notice.AckGoalResumeNotice(old)
 				}
 			} else if canceled {
-				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgGoalCanceled))
+				e.reply(p, msg.ReplyCtx, "排队的 goal 已取消。")
 			} else {
 				e.reply(p, msg.ReplyCtx, "当前没有 goal。")
 			}

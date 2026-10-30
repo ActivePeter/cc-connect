@@ -358,7 +358,7 @@ func TestQueuedGoalRechecksActive(t *testing.T) {
 	if _, _, sets := as.state(); sets != 0 {
 		t.Fatalf("sets = %d", sets)
 	}
-	if got := p.getSent(); !strings.Contains(got[len(got)-1], "send it again") {
+	if got := p.getSent(); !strings.Contains(got[len(got)-1], "重发") {
 		t.Fatal(got)
 	}
 }
@@ -405,7 +405,7 @@ func TestGoalClearCancelsQueuedTarget(t *testing.T) {
 	if _, _, sets := as.state(); sets != 0 {
 		t.Fatalf("cleared queued goal was set %d times", sets)
 	}
-	if got := strings.Join(p.getSent(), "|"); !strings.Contains(got, "canceled") {
+	if got := strings.Join(p.getSent(), "|"); !strings.Contains(got, "取消") {
 		t.Fatal(got)
 	}
 }
@@ -473,7 +473,7 @@ type failNoticePlatform struct {
 }
 
 func (p *failNoticePlatform) Reply(ctx context.Context, replyCtx any, content string) error {
-	if !p.failed && strings.Contains(content, "previous goal") {
+	if !p.failed && strings.Contains(content, "重启时清除") {
 		p.failed = true
 		return errors.New("send failed")
 	}
@@ -514,7 +514,7 @@ func TestGoalModeDoesNotDiscardAttachments(t *testing.T) {
 	if _, _, n := as.state(); n != 0 {
 		t.Fatalf("goal set without attachment: %d", n)
 	}
-	if got := strings.Join(p.getSent(), "|"); !strings.Contains(got, "attachments") {
+	if got := strings.Join(p.getSent(), "|"); !strings.Contains(got, "附件") {
 		t.Fatal(got)
 	}
 }

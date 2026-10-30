@@ -206,14 +206,16 @@ type appServerSession struct {
 	currentTurn  string
 	preambleSent bool
 
-	goalClearMu    sync.Mutex
-	goalClearAck   chan struct{} // guarded by goalMu
-	goalMu         sync.Mutex    // mirrors thread/goal/* for /goal status and message gating
-	goalObjective  string
-	goalStatus     string
-	goalTokensUsed int64
-	resumeGoal     string
-	goalNotice     string // notice held until the current turn's result is out
+	goalClearPending  int
+	goalClearInFlight bool
+	goalClearEarly    bool
+	goalSetAfterClear bool
+	goalMu            sync.Mutex // mirrors thread/goal/* for /goal status and message gating
+	goalObjective     string
+	goalStatus        string
+	goalTokensUsed    int64
+	resumeGoal        string
+	goalNotice        string // notice held until the current turn's result is out
 
 	runtimeMu sync.RWMutex
 	usage     *core.UsageReport
@@ -1198,10 +1200,17 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 			return
 		}
 		s.goalMu.Lock()
-		s.goalObjective, s.goalStatus, s.goalTokensUsed = "", "", 0
-		if s.goalClearAck != nil {
-			close(s.goalClearAck)
-			s.goalClearAck = nil
+		discard := false
+		if s.goalClearPending > 0 {
+			s.goalClearPending--
+			discard = s.goalSetAfterClear
+		} else if s.goalClearInFlight {
+			// The reader can process the notification before ClearGoal
+			// receives the response, despite the wire ordering.
+			s.goalClearEarly = true
+		}
+		if !discard {
+			s.goalObjective, s.goalStatus, s.goalTokensUsed = "", "", 0
 		}
 		s.goalMu.Unlock()
 
@@ -1609,11 +1618,6 @@ func (s *appServerSession) AckGoalResumeNotice(objective string) {
 }
 
 func (s *appServerSession) SetGoal(objective string) (core.GoalInfo, error) {
-	s.goalClearMu.Lock()
-	defer s.goalClearMu.Unlock()
-	if err := s.waitGoalClearNotice(); err != nil {
-		return core.GoalInfo{}, err
-	}
 	threadID := s.CurrentSessionID()
 	if threadID == "" {
 		return core.GoalInfo{}, fmt.Errorf("codex app-server thread id is empty")
@@ -1623,8 +1627,12 @@ func (s *appServerSession) SetGoal(objective string) (core.GoalInfo, error) {
 	if err := s.request("thread/goal/set", params, &resp); err != nil {
 		return core.GoalInfo{}, err
 	}
-	s.storeGoal(resp.Goal)
-	return s.GetGoal(), nil
+	s.goalMu.Lock()
+	s.goalSetAfterClear = true
+	s.goalObjective, s.goalStatus, s.goalTokensUsed = resp.Goal.Objective, resp.Goal.Status, resp.Goal.TokensUsed
+	info := core.GoalInfo{Objective: s.goalObjective, Status: s.goalStatus, TokensUsed: s.goalTokensUsed}
+	s.goalMu.Unlock()
+	return info, nil
 }
 
 // GetGoal returns the cached state; it never performs a round-trip.
@@ -1634,59 +1642,29 @@ func (s *appServerSession) GetGoal() core.GoalInfo {
 	return core.GoalInfo{Objective: s.goalObjective, Status: s.goalStatus, TokensUsed: s.goalTokensUsed}
 }
 
-// waitGoalClearNotice keeps a later set from being overwritten by the
-// previous clear notification, which may arrive after the clear response.
-func (s *appServerSession) waitGoalClearNotice() error {
-	s.goalMu.Lock()
-	ack := s.goalClearAck
-	s.goalMu.Unlock()
-	if ack == nil {
-		return nil
-	}
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-ack:
-		return nil
-	case <-s.contextDone():
-		return s.contextErr()
-	case <-timer.C:
-		return fmt.Errorf("timed out waiting for goal clear notification")
-	}
-}
-
 func (s *appServerSession) ClearGoal() error {
-	s.goalClearMu.Lock()
-	defer s.goalClearMu.Unlock()
-	if err := s.waitGoalClearNotice(); err != nil {
-		return err
-	}
 	threadID := s.CurrentSessionID()
 	if threadID == "" {
 		return fmt.Errorf("codex app-server thread id is empty")
 	}
-	ack := make(chan struct{})
 	s.goalMu.Lock()
-	hadGoal := s.goalObjective != ""
-	s.goalClearAck = ack
+	s.goalClearInFlight = true
+	s.goalClearEarly = false
 	s.goalMu.Unlock()
 	var resp threadGoalClearResponse
-	if err := s.request("thread/goal/clear", map[string]any{"threadId": threadID, "origin": "user"}, &resp); err != nil {
-		return err
-	}
-	if !resp.Cleared && !hadGoal {
-		s.goalMu.Lock()
-		if s.goalClearAck == ack {
-			s.goalClearAck = nil
-			close(ack)
+	err := s.request("thread/goal/clear", map[string]any{"threadId": threadID, "origin": "user"}, &resp)
+	s.goalMu.Lock()
+	if err == nil {
+		if resp.Cleared && !s.goalClearEarly {
+			s.goalClearPending++
 		}
-		s.goalMu.Unlock()
+		s.goalSetAfterClear = false
+		s.goalObjective, s.goalStatus, s.goalTokensUsed = "", "", 0
 	}
-	if err := s.waitGoalClearNotice(); err != nil {
-		return err
-	}
-	s.storeGoal(threadGoal{})
-	return nil
+	s.goalClearInFlight = false
+	s.goalClearEarly = false
+	s.goalMu.Unlock()
+	return err
 }
 
 func (s *appServerSession) storeGoal(g threadGoal) {

@@ -43,7 +43,7 @@ func fakeGoalSession(t *testing.T, replies map[string]string, observe ...func(ma
 				if len(observe) > 0 {
 					observe[0](map[string]any{"method": "after-clear-response"})
 				}
-				if res == `{"cleared":true}` {
+				if res == `{"cleared":true}` && replies["test/manual-notice"] != "true" {
 					s.handleNotification("thread/goal/cleared", json.RawMessage(`{"threadId":"thread-1"}`))
 				}
 			}
@@ -169,62 +169,77 @@ func TestGoalResumeReportsLookupFailure(t *testing.T) {
 	}
 }
 
-func TestGoalSetWaitsForEarlierClearNotification(t *testing.T) {
-	responseSent, allowNotification := make(chan struct{}), make(chan struct{})
-	s, methods := fakeGoalSession(t, map[string]string{
-		"thread/goal/clear": `{"cleared":true}`,
-		"thread/goal/set":   `{"goal":{"threadId":"thread-1","objective":"new","status":"active"}}`,
-	}, func(req map[string]any) {
-		if req["method"] == "after-clear-response" {
-			close(responseSent)
-			<-allowNotification
-		}
+func TestGoalSetDoesNotWaitForEarlierClearNotification(t *testing.T) {
+	s, _ := fakeGoalSession(t, map[string]string{
+		"thread/goal/clear":  `{"cleared":true}`,
+		"thread/goal/set":    `{"goal":{"threadId":"thread-1","objective":"new","status":"active"}}`,
+		"test/manual-notice": "true",
 	})
-	clearDone := make(chan error, 1)
-	go func() { clearDone <- s.ClearGoal() }()
-	<-responseSent
+	s.storeGoal(threadGoal{Objective: "old", Status: "active"})
+	if err := s.ClearGoal(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := s.SetGoal("new"); done <- err }()
 	select {
-	case err := <-clearDone:
-		t.Fatalf("clear completed before notification: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("set waited for a clear notification")
 	}
-	setDone := make(chan error, 1)
-	go func() { _, err := s.SetGoal("new"); setDone <- err }()
-	close(allowNotification)
-	if err := <-clearDone; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-setDone; err != nil {
-		t.Fatal(err)
-	}
-	if got := methods(); len(got) != 2 || got[0] != "thread/goal/clear" || got[1] != "thread/goal/set" {
+	s.handleNotification("thread/goal/cleared", json.RawMessage(`{"threadId":"other"}`))
+	s.handleNotification("thread/goal/cleared", json.RawMessage(`{"threadId":"thread-1"}`))
+	if got := s.GetGoal(); !got.Active() || got.Objective != "new" {
 		t.Fatal(got)
+	}
+}
+
+func TestGoalClearFalseDoesNotDelaySet(t *testing.T) {
+	s, _ := fakeGoalSession(t, map[string]string{
+		"thread/goal/clear": `{"cleared":false}`,
+		"thread/goal/set":   `{"goal":{"threadId":"thread-1","objective":"new","status":"active"}}`,
+	})
+	s.storeGoal(threadGoal{Objective: "old", Status: "active"})
+	if err := s.ClearGoal(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := s.SetGoal("new"); done <- err }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("set waited after cleared=false")
 	}
 	if got := s.GetGoal(); !got.Active() || got.Objective != "new" {
 		t.Fatal(got)
 	}
 }
 
-func TestGoalClearFalseWaitsForPriorClearNotice(t *testing.T) {
-	responseSent, release := make(chan struct{}), make(chan struct{})
-	s, _ := fakeGoalSession(t, map[string]string{"thread/goal/clear": `{"cleared":false}`}, func(req map[string]any) {
-		if req["method"] == "after-clear-response" {
-			close(responseSent)
-			<-release
+func TestGoalClearNotificationBeforeResponseProcessing(t *testing.T) {
+	var s *appServerSession
+	s, _ = fakeGoalSession(t, map[string]string{
+		"thread/goal/clear":  `{"cleared":true}`,
+		"thread/goal/set":    `{"goal":{"threadId":"thread-1","objective":"new","status":"active"}}`,
+		"test/manual-notice": "true",
+	}, func(req map[string]any) {
+		if req["method"] == "thread/goal/clear" {
+			s.handleNotification("thread/goal/cleared", json.RawMessage(`{"threadId":"thread-1"}`))
 		}
 	})
-	s.storeGoal(threadGoal{Objective: "old", Status: "active"})
-	done := make(chan error, 1)
-	go func() { done <- s.ClearGoal() }()
-	<-responseSent
-	select {
-	case err := <-done:
-		t.Fatalf("clear completed before earlier notice: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	s.handleNotification("thread/goal/cleared", json.RawMessage(`{"threadId":"thread-1"}`))
-	close(release)
-	if err := <-done; err != nil {
+	if err := s.ClearGoal(); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := s.SetGoal("new"); err != nil {
+		t.Fatal(err)
+	}
+	// An unrelated later clear must not be mistaken for the earlier notice.
+	s.handleNotification("thread/goal/cleared", json.RawMessage(`{"threadId":"thread-1"}`))
+	if got := s.GetGoal(); got.Status != "" {
+		t.Fatal(got)
 	}
 }
