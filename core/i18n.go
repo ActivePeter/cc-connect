@@ -175,6 +175,13 @@ const (
 	MsgPreviousProcessing        MsgKey = "previous_processing"
 	MsgQueueFull                 MsgKey = "queue_full"
 	MsgMessageQueued             MsgKey = "message_queued"
+	MsgGoalQueued                MsgKey = "goal_queued"
+	MsgGoalActiveReject          MsgKey = "goal_active_reject"
+	MsgGoalRetry                 MsgKey = "goal_retry"
+	MsgGoalCanceled              MsgKey = "goal_canceled"
+	MsgGoalResumeNotice          MsgKey = "goal_resume_notice"
+	MsgGoalResumeNone            MsgKey = "goal_resume_none"
+	MsgGoalNoFiles               MsgKey = "goal_attachments_unsupported"
 	MsgMessageInjected           MsgKey = "message_injected"
 	MsgNoToolsAllowed            MsgKey = "no_tools_allowed"
 	MsgCurrentTools              MsgKey = "current_tools"
@@ -752,6 +759,55 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "📨 訊息已插入目前任務。",
 		LangJapanese:           "📨 実行中のタスクにメッセージを追加しました。",
 		LangSpanish:            "📨 Mensaje añadido a la tarea en curso.",
+	},
+	MsgGoalActiveReject: {
+		LangEnglish:            "The current goal is still running. Send /goal clear before setting a new goal.",
+		LangChinese:            "当前 goal 还在执行，先发 /goal clear 再设新目标。",
+		LangTraditionalChinese: "目前 goal 還在執行，先發 /goal clear 再設定新目標。",
+		LangJapanese:           "現在の goal を実行中です。新しい目標の前に /goal clear を送ってください。",
+		LangSpanish:            "El objetivo sigue en curso. Envía /goal clear antes de fijar uno nuevo.",
+	},
+	MsgGoalRetry: {
+		LangEnglish:            "Could not start the goal. Please send it again.",
+		LangChinese:            "没能开始，请重发。",
+		LangTraditionalChinese: "無法開始，請重新傳送。",
+		LangJapanese:           "開始できませんでした。再送してください。",
+		LangSpanish:            "No se pudo iniciar. Vuelve a enviarlo.",
+	},
+	MsgGoalNoFiles: {
+		LangEnglish:            "Goal mode currently supports text only; please send a text goal without attachments.",
+		LangChinese:            "goal 模式目前只支持文字，请发送不带附件的文字目标。",
+		LangTraditionalChinese: "goal 模式目前只支援文字，請傳送不含附件的文字目標。",
+		LangJapanese:           "goal モードは現在テキストのみ対応しています。添付なしで送信してください。",
+		LangSpanish:            "El modo de objetivos solo admite texto; envía un objetivo sin archivos adjuntos.",
+	},
+	MsgGoalCanceled: {
+		LangEnglish:            "The queued goal was canceled.",
+		LangChinese:            "排队的 goal 已取消。",
+		LangTraditionalChinese: "排隊的 goal 已取消。",
+		LangJapanese:           "待機中の goal を取り消しました。",
+		LangSpanish:            "Se canceló el objetivo en espera.",
+	},
+	MsgGoalResumeNotice: {
+		LangEnglish:            "The previous goal was cleared on restart (%s).",
+		LangChinese:            "上次的 goal 已在重启时清除（%s）。",
+		LangTraditionalChinese: "上次的 goal 已在重新啟動時清除（%s）。",
+		LangJapanese:           "前回の goal は再起動時に消去されました（%s）。",
+		LangSpanish:            "El objetivo anterior se borró al reiniciar (%s).",
+	},
+	MsgGoalResumeNone: {
+		LangEnglish:            "There is no current goal (the previous one was cleared on restart: %s).",
+		LangChinese:            "当前没有 goal（上次的已在重启时清除：%s）。",
+		LangTraditionalChinese: "目前沒有 goal（上次的已在重新啟動時清除：%s）。",
+		LangJapanese:           "現在 goal はありません（前回の目標は再起動時に消去されました：%s）。",
+		LangSpanish:            "No hay un objetivo actual (el anterior se borró al reiniciar: %s).",
+	},
+	MsgGoalQueued: {
+		LangEnglish:            "The goal will start after this turn finishes.",
+		LangChinese:            "这一轮结束后开始执行 goal。",
+		LangTraditionalChinese: "這一輪結束後開始執行 goal。",
+		LangJapanese:           "このターンの終了後に goal を開始します。",
+		LangSpanish:            "El objetivo comenzará cuando termine este turno.",
 	},
 	MsgMessageQueued: {
 		LangEnglish:            "📬 Message received — will process after the current task finishes.",

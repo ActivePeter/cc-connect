@@ -5,13 +5,14 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
 
 // fakeGoalSession answers JSON-RPC requests from a canned map keyed by method
 // and records the methods it saw.
-func fakeGoalSession(t *testing.T, replies map[string]string) (*appServerSession, func() []string) {
+func fakeGoalSession(t *testing.T, replies map[string]string, observe ...func(map[string]any)) (*appServerSession, func() []string) {
 	t.Helper()
 	pr, pw := io.Pipe()
 	s := &appServerSession{events: make(chan core.Event, 16), stdin: pw}
@@ -27,6 +28,9 @@ func fakeGoalSession(t *testing.T, replies map[string]string) (*appServerSession
 				return
 			}
 			method, _ := req["method"].(string)
+			if len(observe) > 0 {
+				observe[0](req)
+			}
 			mu.Lock()
 			methods = append(methods, method)
 			mu.Unlock()
@@ -35,6 +39,14 @@ func fakeGoalSession(t *testing.T, replies map[string]string) (*appServerSession
 				res = "{}"
 			}
 			s.handleResponse(rpcResponseEnvelope{ID: req["id"], Result: json.RawMessage(res)})
+			if method == "thread/goal/clear" {
+				if len(observe) > 0 {
+					observe[0](map[string]any{"method": "after-clear-response"})
+				}
+				if res == `{"cleared":true}` {
+					s.handleNotification("thread/goal/cleared", json.RawMessage(`{"threadId":"thread-1"}`))
+				}
+			}
 		}
 	}()
 	t.Cleanup(func() { _ = pw.Close(); _ = pr.Close() })
@@ -58,13 +70,21 @@ func drainEvents(s *appServerSession) []core.Event {
 }
 
 func TestGoalControllerSetClear(t *testing.T) {
+	requests := make(chan map[string]any, 1)
 	s, methods := fakeGoalSession(t, map[string]string{
 		"thread/goal/set":   `{"goal":{"threadId":"thread-1","objective":"make tests pass","status":"active","tokensUsed":0}}`,
 		"thread/goal/clear": `{"cleared":true}`,
+	}, func(req map[string]any) {
+		if req["method"] == "thread/goal/set" {
+			requests <- req["params"].(map[string]any)
+		}
 	})
 	info, err := s.SetGoal("make tests pass")
 	if err != nil || !info.Active() || s.GetGoal().Objective != "make tests pass" {
 		t.Fatalf("SetGoal = %#v, %v", info, err)
+	}
+	if params := <-requests; params["status"] != "active" {
+		t.Fatalf("goal/set params = %v", params)
 	}
 	if err := s.ClearGoal(); err != nil || s.GetGoal().Status != "" {
 		t.Fatalf("ClearGoal = %v, cache = %#v", err, s.GetGoal())
@@ -112,8 +132,99 @@ func TestGoalNoticeDeferredAndResumeClears(t *testing.T) {
 	if g := s.GetGoal(); g.Status != "" {
 		t.Fatalf("active goal survived resume: %#v", g)
 	}
-	s.flushGoalNotice()
+	s.flushGoalNotice(true)
 	if evs := drainEvents(s); len(evs) != 1 || evs[0].Type != core.EventGoal {
 		t.Fatalf("resume notice = %#v", evs)
+	}
+}
+
+func TestGoalResumeNoticeConsumed(t *testing.T) {
+	s, _ := fakeGoalSession(t, map[string]string{
+		"thread/goal/get":   `{"goal":{"threadId":"thread-1","objective":"old","status":"active"}}`,
+		"thread/goal/clear": `{"cleared":true}`,
+	})
+	s.syncGoalAfterResume()
+	s.stateMu.Lock()
+	s.currentTurn = "old-turn"
+	s.stateMu.Unlock()
+	s.handleGoalUpdated(threadGoal{Objective: "other", Status: "paused"})
+	s.completeTurn()
+	if got := drainEvents(s); len(got) != 2 || got[0].Type != core.EventResult || got[1].Type != core.EventGoal {
+		t.Fatalf("terminal notice should not consume resume notice: %#v", got)
+	}
+	if got := s.GoalResumeNotice(); got != "old" {
+		t.Fatalf("notice = %q", got)
+	}
+	s.AckGoalResumeNotice("old")
+	s.flushGoalNotice(false)
+	if got := drainEvents(s); len(got) != 0 {
+		t.Fatalf("duplicate notice: %#v", got)
+	}
+}
+
+func TestGoalResumeReportsLookupFailure(t *testing.T) {
+	s, _ := fakeGoalSession(t, map[string]string{"thread/goal/get": `{"goal":42}`})
+	if err := s.syncGoalAfterResume(); err == nil {
+		t.Fatal("goal lookup failure was ignored")
+	}
+}
+
+func TestGoalSetWaitsForEarlierClearNotification(t *testing.T) {
+	responseSent, allowNotification := make(chan struct{}), make(chan struct{})
+	s, methods := fakeGoalSession(t, map[string]string{
+		"thread/goal/clear": `{"cleared":true}`,
+		"thread/goal/set":   `{"goal":{"threadId":"thread-1","objective":"new","status":"active"}}`,
+	}, func(req map[string]any) {
+		if req["method"] == "after-clear-response" {
+			close(responseSent)
+			<-allowNotification
+		}
+	})
+	clearDone := make(chan error, 1)
+	go func() { clearDone <- s.ClearGoal() }()
+	<-responseSent
+	select {
+	case err := <-clearDone:
+		t.Fatalf("clear completed before notification: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	setDone := make(chan error, 1)
+	go func() { _, err := s.SetGoal("new"); setDone <- err }()
+	close(allowNotification)
+	if err := <-clearDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-setDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := methods(); len(got) != 2 || got[0] != "thread/goal/clear" || got[1] != "thread/goal/set" {
+		t.Fatal(got)
+	}
+	if got := s.GetGoal(); !got.Active() || got.Objective != "new" {
+		t.Fatal(got)
+	}
+}
+
+func TestGoalClearFalseWaitsForPriorClearNotice(t *testing.T) {
+	responseSent, release := make(chan struct{}), make(chan struct{})
+	s, _ := fakeGoalSession(t, map[string]string{"thread/goal/clear": `{"cleared":false}`}, func(req map[string]any) {
+		if req["method"] == "after-clear-response" {
+			close(responseSent)
+			<-release
+		}
+	})
+	s.storeGoal(threadGoal{Objective: "old", Status: "active"})
+	done := make(chan error, 1)
+	go func() { done <- s.ClearGoal() }()
+	<-responseSent
+	select {
+	case err := <-done:
+		t.Fatalf("clear completed before earlier notice: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	s.handleNotification("thread/goal/cleared", json.RawMessage(`{"threadId":"thread-1"}`))
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

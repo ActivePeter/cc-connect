@@ -206,10 +206,13 @@ type appServerSession struct {
 	currentTurn  string
 	preambleSent bool
 
-	goalMu         sync.Mutex // mirrors thread/goal/* for /goal status and message gating
+	goalClearMu    sync.Mutex
+	goalClearAck   chan struct{} // guarded by goalMu
+	goalMu         sync.Mutex    // mirrors thread/goal/* for /goal status and message gating
 	goalObjective  string
 	goalStatus     string
 	goalTokensUsed int64
+	resumeGoal     string
 	goalNotice     string // notice held until the current turn's result is out
 
 	runtimeMu sync.RWMutex
@@ -368,7 +371,12 @@ func (s *appServerSession) ensureThread(resumeID string) error {
 		s.applyThreadRuntimeState(resp.Cwd, resp.Model, resp.ReasoningEffort)
 		s.threadID.Store(resp.Thread.ID)
 		slog.Info("codex app-server thread resumed", "thread_id", resp.Thread.ID)
-		s.syncGoalAfterResume()
+		if err := s.syncGoalAfterResume(); err != nil {
+			if core.IsGoalQuery(s.ctx) {
+				return err
+			}
+			slog.Warn("codex app-server goal sync after resume failed", "error", err)
+		}
 		return nil
 	}
 
@@ -479,7 +487,7 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	}
 	// The engine drains stale events before Send, so a notice queued at resume
 	// time is released here instead of being drained away.
-	s.flushGoalNotice()
+	s.flushGoalNotice(true)
 
 	if len(files) > 0 {
 		filePaths := core.SaveFilesToDisk(s.workDir, messageID, files)
@@ -1183,8 +1191,19 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 		}
 
 	case "thread/goal/cleared":
-		// /goal clear already answered the user; the cache is the whole job.
-		s.storeGoal(threadGoal{})
+		var notif struct {
+			ThreadID string `json:"threadId"`
+		}
+		if json.Unmarshal(paramsRaw, &notif) != nil || notif.ThreadID != s.CurrentSessionID() {
+			return
+		}
+		s.goalMu.Lock()
+		s.goalObjective, s.goalStatus, s.goalTokensUsed = "", "", 0
+		if s.goalClearAck != nil {
+			close(s.goalClearAck)
+			s.goalClearAck = nil
+		}
+		s.goalMu.Unlock()
 
 	case "account/rateLimits/updated":
 		var notif appServerRateLimitsResponse
@@ -1566,18 +1585,41 @@ func (s *appServerSession) completeTurn() {
 	// A goal status change that arrived mid-turn must be announced only after
 	// this turn's text has been delivered: codex marks the goal complete a few
 	// seconds before the (check) turn itself completes.
-	s.flushGoalNotice()
+	s.flushGoalNotice(false)
 }
 
 // ── GoalController ────────────────────────────────────────────
 
+func (s *appServerSession) GoalTurnRunning() bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.currentTurn != ""
+}
+func (s *appServerSession) GoalResumeNotice() string {
+	s.goalMu.Lock()
+	defer s.goalMu.Unlock()
+	return s.resumeGoal
+}
+func (s *appServerSession) AckGoalResumeNotice(objective string) {
+	s.goalMu.Lock()
+	defer s.goalMu.Unlock()
+	if objective != "" && s.resumeGoal == objective {
+		s.resumeGoal = ""
+	}
+}
+
 func (s *appServerSession) SetGoal(objective string) (core.GoalInfo, error) {
+	s.goalClearMu.Lock()
+	defer s.goalClearMu.Unlock()
+	if err := s.waitGoalClearNotice(); err != nil {
+		return core.GoalInfo{}, err
+	}
 	threadID := s.CurrentSessionID()
 	if threadID == "" {
 		return core.GoalInfo{}, fmt.Errorf("codex app-server thread id is empty")
 	}
 	var resp threadGoalSetResponse
-	params := map[string]any{"threadId": threadID, "objective": objective, "origin": "user"}
+	params := map[string]any{"threadId": threadID, "objective": objective, "status": "active", "origin": "user"}
 	if err := s.request("thread/goal/set", params, &resp); err != nil {
 		return core.GoalInfo{}, err
 	}
@@ -1592,13 +1634,55 @@ func (s *appServerSession) GetGoal() core.GoalInfo {
 	return core.GoalInfo{Objective: s.goalObjective, Status: s.goalStatus, TokensUsed: s.goalTokensUsed}
 }
 
+// waitGoalClearNotice keeps a later set from being overwritten by the
+// previous clear notification, which may arrive after the clear response.
+func (s *appServerSession) waitGoalClearNotice() error {
+	s.goalMu.Lock()
+	ack := s.goalClearAck
+	s.goalMu.Unlock()
+	if ack == nil {
+		return nil
+	}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ack:
+		return nil
+	case <-s.contextDone():
+		return s.contextErr()
+	case <-timer.C:
+		return fmt.Errorf("timed out waiting for goal clear notification")
+	}
+}
+
 func (s *appServerSession) ClearGoal() error {
+	s.goalClearMu.Lock()
+	defer s.goalClearMu.Unlock()
+	if err := s.waitGoalClearNotice(); err != nil {
+		return err
+	}
 	threadID := s.CurrentSessionID()
 	if threadID == "" {
 		return fmt.Errorf("codex app-server thread id is empty")
 	}
+	ack := make(chan struct{})
+	s.goalMu.Lock()
+	hadGoal := s.goalObjective != ""
+	s.goalClearAck = ack
+	s.goalMu.Unlock()
 	var resp threadGoalClearResponse
 	if err := s.request("thread/goal/clear", map[string]any{"threadId": threadID, "origin": "user"}, &resp); err != nil {
+		return err
+	}
+	if !resp.Cleared && !hadGoal {
+		s.goalMu.Lock()
+		if s.goalClearAck == ack {
+			s.goalClearAck = nil
+			close(ack)
+		}
+		s.goalMu.Unlock()
+	}
+	if err := s.waitGoalClearNotice(); err != nil {
 		return err
 	}
 	s.storeGoal(threadGoal{})
@@ -1648,11 +1732,19 @@ func (s *appServerSession) handleGoalUpdated(g threadGoal) {
 
 // flushGoalNotice releases a notice held by handleGoalUpdated (or by the
 // resume check) once it is safe to show it.
-func (s *appServerSession) flushGoalNotice() {
+func (s *appServerSession) flushGoalNotice(userTurn bool) {
 	s.goalMu.Lock()
+	resumeNotice := ""
+	if userTurn && s.resumeGoal != "" {
+		resumeNotice = fmt.Sprintf("上次的 goal 已在重启时清除（%s）。需要的话重新发 /goal。", s.resumeGoal)
+		s.resumeGoal = ""
+	}
 	notice := s.goalNotice
 	s.goalNotice = ""
 	s.goalMu.Unlock()
+	if resumeNotice != "" {
+		s.emit(core.Event{Type: core.EventGoal, Content: resumeNotice})
+	}
 	if notice != "" {
 		s.emit(core.Event{Type: core.EventGoal, Content: notice})
 	}
@@ -1662,33 +1754,33 @@ func (s *appServerSession) flushGoalNotice() {
 // cc-connect restarted while codex still had an active goal, resuming the
 // thread would spend quota with nobody watching. The goal is cleared and the
 // user is told on the next turn.
-func (s *appServerSession) syncGoalAfterResume() {
+func (s *appServerSession) syncGoalAfterResume() error {
 	threadID := s.CurrentSessionID()
 	if threadID == "" {
-		return
+		return fmt.Errorf("goal resume: empty thread id")
 	}
 	var resp threadGoalGetResponse
 	if err := s.request("thread/goal/get", map[string]any{"threadId": threadID}, &resp); err != nil {
-		slog.Warn("codex app-server goal/get after resume failed", "error", err)
-		return
+		return fmt.Errorf("codex app-server goal/get after resume: %w", err)
 	}
 	if resp.Goal == nil {
 		s.storeGoal(threadGoal{})
-		return
+		return nil
 	}
 	if !strings.EqualFold(resp.Goal.Status, "active") {
 		s.storeGoal(*resp.Goal)
-		return
+		return nil
 	}
 	objective := resp.Goal.Objective
+	s.storeGoal(*resp.Goal)
 	if err := s.ClearGoal(); err != nil {
-		slog.Warn("codex app-server goal/clear after resume failed", "error", err)
-		return
+		return fmt.Errorf("codex app-server goal/clear after resume: %w", err)
 	}
 	s.goalMu.Lock()
-	s.goalNotice = fmt.Sprintf("上次的 goal 已在重启时清除（%s）。需要的话重新发 /goal。", objective)
+	s.resumeGoal = objective
 	s.goalMu.Unlock()
 	slog.Info("codex app-server goal cleared after resume", "thread_id", threadID)
+	return nil
 }
 
 func (s *appServerSession) flushPendingAsThinking() {

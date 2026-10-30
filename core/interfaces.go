@@ -459,6 +459,25 @@ type GoalController interface {
 // "goal mode, but no live session yet" (codex app-server).
 type GoalAwareAgent interface{ SupportsGoalMode() bool }
 
+type goalQueryKey struct{}
+
+// GoalQueryContext prevents replacing a saved thread when a goal query resume fails.
+func GoalQueryContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, goalQueryKey{}, true)
+}
+
+// IsGoalQuery reports whether the startup is for a goal status/clear query.
+func IsGoalQuery(ctx context.Context) bool { return ctx.Value(goalQueryKey{}) == true }
+
+// GoalResumeNotice exposes a notice about a goal cleared on resume.
+type GoalResumeNotice interface {
+	GoalResumeNotice() string
+	AckGoalResumeNotice(string)
+}
+
+// GoalTurnRunning reports a background agent turn not represented by Session.Busy.
+type GoalTurnRunning interface{ GoalTurnRunning() bool }
+
 // EventGoal is a one-line goal notice (started, achieved, paused, cleared).
 // It is relayed as its own message and never ends a turn.
 const EventGoal EventType = "goal"

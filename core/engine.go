@@ -463,6 +463,7 @@ type Engine struct {
 	// Interactive agent session management
 	interactiveMu     sync.Mutex
 	interactiveStates map[string]*interactiveState // key = sessionKey
+	goalModeAlways    bool
 
 	platformLifecycleMu sync.Mutex
 	platformReady       map[Platform]bool
@@ -506,6 +507,8 @@ type workspaceInitFlow struct {
 // The message is NOT sent to agent stdin at queue time; the event loop
 // sends it after the current turn completes to avoid mid-turn interference.
 type queuedMessage struct {
+	goalObjective     bool
+	goalSeq           uint64
 	messageID         string
 	platform          Platform
 	replyCtx          any
@@ -538,6 +541,8 @@ type interactiveState struct {
 	stopped                  bool
 	pending                  *pendingPermission
 	pendingMessages          []queuedMessage // messages queued while session was busy
+	goalControlMu            sync.Mutex      // serializes goal set/clear; acquired before mu
+	goalSeq                  uint64          // guarded by mu; invalidates queued goals on clear
 	midTurnReady             bool            // first input written; cleared before processing a terminal result
 	approveAll               bool            // when true, auto-approve all permission requests for this session
 	fromVoice                bool            // true if current turn originated from voice transcription
@@ -782,6 +787,8 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 // DefaultWorkspaceIdleTimeout is the default time a workspace can be idle
 // before the reaper reclaims it.
 const DefaultWorkspaceIdleTimeout = 15 * time.Minute
+
+func (e *Engine) SetGoalModeAlways(always bool) { e.goalModeAlways = always }
 
 // SetMultiWorkspace enables multi-workspace mode for the engine.
 func (e *Engine) SetMultiWorkspace(baseDir, bindingStorePath string) {
@@ -3024,7 +3031,27 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	// A goal that is still being pursued owns the session: answer the message
 	// without handing it to the agent. Commands (including /goal and /stop)
 	// were already handled above.
-	if e.blockMessageForActiveGoal(p, msg, interactiveKey) {
+	if e.goalModeAlways && !strings.HasPrefix(content, "/") {
+		if ga, ok := agent.(GoalAwareAgent); ok && ga.SupportsGoalMode() {
+			msg.goalObjective = true
+		}
+	}
+	if msg.goalObjective {
+		if len(msg.Images) > 0 || len(msg.Files) > 0 {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgGoalNoFiles))
+			return
+		}
+		if gc := e.liveGoalController(interactiveKey); gc != nil {
+			if gc.GetGoal().Active() {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgGoalActiveReject))
+				return
+			}
+			if running, ok := gc.(GoalTurnRunning); ok && running.GoalTurnRunning() && !sessions.GetOrCreateActive(msg.SessionKey).Busy() {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgGoalRetry))
+				return
+			}
+		}
+	} else if e.blockMessageForActiveGoal(p, msg, interactiveKey) {
 		return
 	}
 
@@ -3042,7 +3069,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 			return
 		}
-		if e.injectUserMessageForBusySession(p, msg, interactiveKey, session, sessions) {
+		if !msg.goalObjective && e.injectUserMessageForBusySession(p, msg, interactiveKey, session, sessions) {
 			return
 		}
 		// Session is busy — try to queue the message for the running turn
@@ -3092,7 +3119,21 @@ sessionLocked:
 		"session", session.ID,
 	)
 
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+	if msg.goalObjective {
+		started := make(chan struct{})
+		var once sync.Once
+		msg.goalStarted = func() { once.Do(func() { close(started) }) }
+		go func() {
+			defer msg.goalStarted()
+			e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+		}()
+		select {
+		case <-started:
+		case <-e.ctx.Done():
+		}
+	} else {
+		go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+	}
 }
 
 func runMessageAccepted(msg *Message) {
@@ -3201,6 +3242,8 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		return true // handled: queue-full reply sent
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
+		goalObjective:     msg.goalObjective,
+		goalSeq:           state.goalSeq,
 		messageID:         msg.MessageID,
 		platform:          p,
 		replyCtx:          msg.ReplyCtx,
@@ -3231,7 +3274,11 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		"user", msg.UserName,
 		"queue_depth", queueDepth,
 	)
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	if msg.goalObjective {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgGoalQueued))
+	} else {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	}
 	return true
 }
 
@@ -3840,7 +3887,15 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			sendDone <- fmt.Errorf("agent session became nil")
 			return
 		}
-		sendDone <- sendForegroundMessage(state, as, promptContent, msg.MessageID, msg.Images, msg.Files)
+		if msg.goalObjective {
+			state.goalControlMu.Lock()
+			err := e.sendGoal(as, msg.Content, p, msg.ReplyCtx)
+			state.goalControlMu.Unlock()
+			msg.goalStarted()
+			sendDone <- err
+		} else {
+			sendDone <- sendForegroundMessage(state, as, promptContent, msg.MessageID, msg.Images, msg.Files)
+		}
 	}()
 
 	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
@@ -4007,6 +4062,7 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 		return
 	}
 	existing.mu.Lock()
+	newState.goalSeq = existing.goalSeq
 	if len(existing.pendingMessages) > 0 {
 		newState.pendingMessages = existing.pendingMessages
 		existing.pendingMessages = nil
@@ -4016,7 +4072,8 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 
 // When agentOverride is non-nil it is used instead of e.agent to start the session.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string) *interactiveState {
+// A goal query must preserve the saved ID and report resume failure instead of starting a new thread.
+func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, goalQuery ...bool) *interactiveState {
 	e.interactiveMu.Lock()
 	defer e.interactiveMu.Unlock()
 
@@ -4124,6 +4181,12 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// resume a conversation that has nothing to do with this project.
 	if startSessionID != "" {
 		if validator, ok := agent.(SessionIDValidator); ok && !validator.ValidateSessionID(e.ctx, startSessionID) {
+			if len(goalQuery) > 0 && goalQuery[0] {
+				state := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true}
+				adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], state)
+				e.interactiveStates[sessionKey] = state
+				return state
+			}
 			slog.Warn("session ID does not belong to this project, clearing it",
 				"session_key", sessionKey, "invalid_session_id", startSessionID)
 			session.SetAgentSessionID("", agent.Name())
@@ -4133,11 +4196,15 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 	isResume := startSessionID != ""
 	startAt := time.Now()
-	agentSession, err := agent.StartSession(e.ctx, startSessionID)
+	startCtx := e.ctx
+	if len(goalQuery) > 0 && goalQuery[0] {
+		startCtx = GoalQueryContext(startCtx)
+	}
+	agentSession, err := agent.StartSession(startCtx, startSessionID)
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		// If resume/continue failed, try a fresh session as fallback.
-		if startSessionID != "" {
+		if startSessionID != "" && (len(goalQuery) == 0 || !goalQuery[0]) {
 			slog.Error("session resume failed, falling back to fresh session",
 				"session_key", sessionKey, "failed_session_id", startSessionID,
 				"error", err, "elapsed", startElapsed)
@@ -4922,6 +4989,16 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 		case err := <-pendingSend:
 			pendingSend = nil
+			if errors.Is(err, errGoalCanceled) {
+				return
+			}
+			if errors.Is(err, errGoalBusy) {
+				state.mu.Lock()
+				p := state.platform
+				state.mu.Unlock()
+				e.reply(p, replyCtx, e.i18n.T(MsgGoalRetry))
+				return
+			}
 			if err != nil {
 				slog.Error("failed to send prompt", "error", err, "session_key", sessionKey)
 				sp.discard()
@@ -5972,6 +6049,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 				state.mu.Unlock()
 
+				if !queued.goalObjective && e.blockMessageForActiveGoal(queued.platform, &Message{ReplyCtx: queued.replyCtx}, sessionKey) {
+					return
+				}
 				// Stop the previous turn's typing indicator
 				if stopTyping != nil {
 					stopTyping()
@@ -6011,7 +6091,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						nextSend <- fmt.Errorf("agent session became nil")
 						return
 					}
-					nextSend <- sendForegroundMessage(state, as, queuedPrompt, queued.messageID, queued.images, queued.files)
+					if queued.goalObjective {
+						nextSend <- e.sendQueuedGoal(state, as, queued.goalSeq, queued.content, queued.platform, queued.replyCtx)
+					} else {
+						nextSend <- sendForegroundMessage(state, as, queuedPrompt, queued.messageID, queued.images, queued.files)
+					}
 				}()
 				pendingSend = nextSend
 
@@ -6317,6 +6401,9 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 		state.mu.Unlock()
 
+		if !queued.goalObjective && e.blockMessageForActiveGoal(queued.platform, &Message{ReplyCtx: queued.replyCtx}, sessionKey) {
+			continue
+		}
 		e.i18n.DetectAndSet(queued.content)
 		prompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
 
@@ -6339,7 +6426,11 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 				sendDone <- fmt.Errorf("agent session became nil")
 				return
 			}
-			sendDone <- sendForegroundMessage(state, as, prompt, queued.messageID, queued.images, queued.files)
+			if queued.goalObjective {
+				sendDone <- e.sendQueuedGoal(state, as, queued.goalSeq, queued.content, queued.platform, queued.replyCtx)
+			} else {
+				sendDone <- sendForegroundMessage(state, as, prompt, queued.messageID, queued.images, queued.files)
+			}
 		}()
 
 		var stopTyping func()
@@ -6477,24 +6568,122 @@ func (e *Engine) blockMessageForActiveGoal(p Platform, msg *Message, interactive
 	return true
 }
 
+var errGoalBusy = errors.New("queued goal is busy")
+var errGoalCanceled = errors.New("queued goal canceled")
+
+func (e *Engine) sendQueuedGoal(state *interactiveState, as AgentSession, seq uint64, objective string, p Platform, replyCtx any) error {
+	state.goalControlMu.Lock()
+	defer state.goalControlMu.Unlock()
+	state.mu.Lock()
+	canceled := seq != state.goalSeq
+	state.mu.Unlock()
+	if canceled {
+		return errGoalCanceled
+	}
+	gc, ok := as.(GoalController)
+	if !ok {
+		return fmt.Errorf("agent session does not support goals")
+	}
+	running, hasRunning := as.(GoalTurnRunning)
+	if gc.GetGoal().Active() || (hasRunning && running.GoalTurnRunning()) {
+		return errGoalBusy
+	}
+	return e.sendGoal(as, objective, p, replyCtx)
+}
+
+func (e *Engine) sendGoal(as AgentSession, objective string, p Platform, replyCtx any) error {
+	gc, ok := as.(GoalController)
+	if !ok {
+		return fmt.Errorf("agent session does not support goals")
+	}
+	if notice, ok := as.(GoalResumeNotice); ok {
+		if old := notice.GoalResumeNotice(); old != "" {
+			if err := e.replyWithError(p, replyCtx, e.i18n.Tf(MsgGoalResumeNotice, old)); err != nil {
+				return err
+			}
+			notice.AckGoalResumeNotice(old)
+		}
+	}
+	info, err := gc.SetGoal(objective)
+	if err != nil {
+		return err
+	}
+	e.reply(p, replyCtx, fmt.Sprintf("goal 已设置（%s）：%s\n达成或要停止时发 /goal clear。", info.Status, info.Objective))
+	return nil
+}
+
 // cmdGoal handles /goal, /goal <condition> and /goal clear. Returns false
 // when the text should go to the agent verbatim (agents with a native /goal,
 // e.g. Claude Code).
 func (e *Engine) cmdGoal(p Platform, msg *Message, args []string) bool {
-	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
+	agent, sessions, interactiveKey, workspaceDir, err := e.commandContextWithWorkspace(p, msg)
+	if forced := e.sendWorkDirForSession(msg.SessionKey); forced != "" {
+		agent, sessions, err = e.getOrCreateWorkspaceAgent(forced)
+		interactiveKey, workspaceDir = forced+":"+msg.SessionKey, forced
+	}
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return true
 	}
+	arg := strings.TrimSpace(strings.Join(args, " "))
 	gc := e.liveGoalController(interactiveKey)
-	if gc == nil {
-		if ga, ok := agent.(GoalAwareAgent); ok && ga.SupportsGoalMode() {
-			e.reply(p, msg.ReplyCtx, "当前没有运行中的会话，goal 要等会话启动后才能设置。先发一条消息，再发 /goal 条件。")
-			return true
+	ga, capable := agent.(GoalAwareAgent)
+	if gc == nil && (!capable || !ga.SupportsGoalMode()) {
+		return false
+	}
+	if arg != "" && !strings.EqualFold(arg, "clear") {
+		msg.Content, msg.goalObjective = arg, true
+		if msg.ExtraContent != "" {
+			msg.Content = msg.ExtraContent + "\n" + arg
 		}
 		return false
 	}
-	arg := strings.TrimSpace(strings.Join(args, " "))
+	if gc == nil {
+		session := sessions.GetOrCreateActive(msg.SessionKey)
+		if session.GetAgentSessionID() == "" {
+			e.reply(p, msg.ReplyCtx, "当前没有 goal。")
+			return true
+		}
+		if !session.TryLock() {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
+			return true
+		}
+		state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agent, msg.SessionKey, true)
+		defer func() {
+			state.mu.Lock()
+			if len(state.pendingMessages) == 0 {
+				session.UnlockWithoutUpdate()
+				state.mu.Unlock()
+				return
+			}
+			state.mu.Unlock()
+			go e.drainOrphanedQueue(session, sessions, interactiveKey, agent, workspaceDir)
+		}()
+		state.mu.Lock()
+		state.workspaceDir = workspaceDir
+		as := state.agentSession
+		state.mu.Unlock()
+		if as != nil {
+			gc, _ = as.(GoalController)
+		}
+		if gc == nil {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
+			return true
+		}
+		e.startUnsolicitedReader(state, session, sessions, interactiveKey, workspaceDir)
+		e.scheduleAgentSessionIdleClose(interactiveKey, state)
+	}
+	notice, _ := gc.(GoalResumeNotice)
+	old := ""
+	if notice != nil && gc.GetGoal().Objective == "" {
+		old = notice.GoalResumeNotice()
+	}
+	if arg == "" && old != "" {
+		if e.replyWithError(p, msg.ReplyCtx, e.i18n.Tf(MsgGoalResumeNone, old)) == nil {
+			notice.AckGoalResumeNotice(old)
+		}
+		return true
+	}
 	switch {
 	case arg == "":
 		info := gc.GetGoal()
@@ -6504,8 +6693,40 @@ func (e *Engine) cmdGoal(p Platform, msg *Message, args []string) bool {
 		}
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf("goal：%s\n状态：%s\n已用 token：%d", info.Objective, info.Status, info.TokensUsed))
 	case strings.EqualFold(arg, "clear"):
+		e.interactiveMu.Lock()
+		state := e.interactiveStates[interactiveKey]
+		e.interactiveMu.Unlock()
+		canceled := false
+		if state != nil {
+			state.goalControlMu.Lock()
+			defer state.goalControlMu.Unlock()
+			state.mu.Lock()
+			state.goalSeq++
+			pending := state.pendingMessages[:0]
+			for _, item := range state.pendingMessages {
+				if item.goalObjective {
+					canceled = true
+				} else {
+					pending = append(pending, item)
+				}
+			}
+			state.pendingMessages = pending
+			state.mu.Unlock()
+		}
 		if gc.GetGoal().Objective == "" {
-			e.reply(p, msg.ReplyCtx, "当前没有 goal。")
+			if old != "" {
+				reply := e.i18n.Tf(MsgGoalResumeNone, old)
+				if canceled {
+					reply += " " + e.i18n.T(MsgGoalCanceled)
+				}
+				if e.replyWithError(p, msg.ReplyCtx, reply) == nil {
+					notice.AckGoalResumeNotice(old)
+				}
+			} else if canceled {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgGoalCanceled))
+			} else {
+				e.reply(p, msg.ReplyCtx, "当前没有 goal。")
+			}
 			return true
 		}
 		if err := gc.ClearGoal(); err != nil {
@@ -6514,20 +6735,7 @@ func (e *Engine) cmdGoal(p Platform, msg *Message, args []string) bool {
 			return true
 		}
 		e.reply(p, msg.ReplyCtx, "goal 已清除。")
-	default:
-		// goal/set starts its own turn; issuing it while a foreground turn is
-		// running would mix the two event streams. Status and clear are safe.
-		if sessions.GetOrCreateActive(msg.SessionKey).Busy() {
-			e.reply(p, msg.ReplyCtx, "当前这一轮还在跑，等它结束再发 /goal 条件。")
-			return true
-		}
-		info, err := gc.SetGoal(arg)
-		if err != nil {
-			slog.Error("goal: set failed", "session", msg.SessionKey, "error", err)
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf("设置 goal 失败：%v", err))
-			return true
-		}
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf("goal 已设置（%s）：%s\n达成或要停止时发 /goal clear。", info.Status, info.Objective))
+
 	}
 	return true
 }

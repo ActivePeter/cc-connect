@@ -3474,3 +3474,13 @@ func TestRemoveGlobalProvider_CleansUpProviderRefs(t *testing.T) {
 		t.Errorf("proj2 provider_refs: want [], got %v", refs2)
 	}
 }
+
+func TestProjectGoalModeConfig(t *testing.T) {
+	var cfg Config
+	if _, err := toml.Decode("[[projects]]\nname = \"goal\"\ngoal_mode = \"always\"\n", &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Projects) != 1 || cfg.Projects[0].GoalMode != "always" {
+		t.Fatalf("projects = %#v", cfg.Projects)
+	}
+}
