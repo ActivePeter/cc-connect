@@ -56,7 +56,7 @@ func (e *Engine) InjectToBusySession(sessionKey, prompt string) (string, error) 
 	}
 
 	state.mu.Lock()
-	if !foregroundBusy && !activeGoalTurnRunning(state.agentSession) {
+	if !foregroundBusy && !agentTurnRunning(state.agentSession) {
 		state.mu.Unlock()
 		return InjectIdle, nil
 	}
@@ -80,7 +80,7 @@ func injectIntoStateLocked(state *interactiveState, prompt, messageID string, im
 	if !ok {
 		return "", ErrInjectUnsupported
 	}
-	if !state.midTurnReady && !activeGoalTurnRunning(state.agentSession) {
+	if !state.midTurnReady && !agentTurnRunning(state.agentSession) {
 		return InjectIdle, nil
 	}
 	if err := sender.SendMidTurn(prompt, messageID, images, files); err != nil {
@@ -89,12 +89,11 @@ func injectIntoStateLocked(state *interactiveState, prompt, messageID string, im
 	return InjectInjected, nil
 }
 
-// activeGoalTurnRunning distinguishes an autonomous goal turn from idle or
-// foreground startup, without enabling injection before an ordinary first Send.
-func activeGoalTurnRunning(as AgentSession) bool {
-	gc, hasGoal := as.(GoalController)
-	running, hasRunning := as.(GoalTurnRunning)
-	return hasGoal && hasRunning && gc.GetGoal().Active() && running.GoalTurnRunning()
+// agentTurnRunning also covers ordinary and finishing Codex turns outside
+// the foreground lock. Before the first real turn it remains false.
+func agentTurnRunning(as AgentSession) bool {
+	running, ok := as.(GoalTurnRunning)
+	return ok && running.GoalTurnRunning()
 }
 
 // sendForegroundMessage arms injection only after the initial input has been

@@ -400,6 +400,7 @@ type Message struct {
 	// than a message already processed. Zero means unset (no ordering hint).
 	UserMessageTimeMs int64
 
+	goalAuto      bool
 	goalObjective bool
 	goalStarted   func()
 }

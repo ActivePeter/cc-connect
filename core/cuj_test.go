@@ -2535,3 +2535,27 @@ func TestCUJ_GoalSteer_InterjectStatusClearStop(t *testing.T) {
 	}
 	waitFor(t, func() bool { return !as.Alive() }, 2*time.Second)
 }
+
+// Queue two interjections, clear the goal, then accept fresh input. Assert the
+// platform acknowledgements so a retained stale queue cannot look successful.
+func TestCUJ_GoalSteer_QueueClearDoesNotLeakIntoNextInput(t *testing.T) {
+	e, p, as, key := deferredFixture(t, true, false)
+	as.injectErr = fmt.Errorf("expired turn")
+	sendText(e, p, key, "first queued correction")
+	sendText(e, p, key, "second queued correction")
+	got := p.getSent()
+	if len(got) != 2 || got[0] != e.i18n.T(MsgDeferredMessageQueued) || got[1] != got[0] {
+		t.Fatalf("queue acknowledgements: %v", got)
+	}
+	sendText(e, p, key, "/goal clear")
+	got = p.getSent()
+	if len(got) != 4 || got[2] != e.i18n.Tf(MsgDeferredQueueCleared, 2) || !strings.Contains(got[3], "goal 已清除") {
+		t.Fatalf("clear acknowledgement: %v", got)
+	}
+	as.injectErr = nil
+	sendText(e, p, key, "fresh correction")
+	got = p.getSent()
+	if len(got) != 5 || got[4] != e.i18n.T(MsgMessageInjected) {
+		t.Fatalf("fresh input was held behind a canceled queue: %v", got)
+	}
+}

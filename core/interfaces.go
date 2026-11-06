@@ -435,6 +435,29 @@ type MidTurnMessageSender interface {
 	SendMidTurn(prompt, messageID string, images []ImageAttachment, files []FileAttachment) error
 }
 
+// DeferredMessageSender retains failed mid-turn input in the cc-connect
+// process until a steerable turn or an ordinary-input boundary is available.
+// Notify is called outside transport locks; canceled messages are counted by
+// ClearMidTurnMessages. Queues are session-local and never persisted.
+type DeferredMessageSender interface {
+	EnqueueMidTurn(DeferredMessage) error
+	PendingMidTurnMessages() int
+	ClearMidTurnMessages() int
+}
+type DeferredMessage struct {
+	Prompt, GoalObjective, MessageID string
+	Images                           []ImageAttachment
+	Files                            []FileAttachment
+	AsGoal, Attempted                bool
+	Notify                           func(status string, err error)
+}
+
+const (
+	DeferredInserted = "inserted"
+	DeferredSent     = "sent"
+	DeferredCanceled = "canceled"
+)
+
 // GoalInfo is a snapshot of a session-scoped native goal.
 type GoalInfo struct {
 	Objective  string

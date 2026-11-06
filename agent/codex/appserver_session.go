@@ -201,6 +201,16 @@ type appServerSession struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
+	queueDeliveryMu               sync.Mutex // serializes queue RPCs with clear/close
+	queueMu                       sync.Mutex
+	messageQueue                  []*deferredMessage
+	queueWake                     chan struct{}
+	queueEpoch                    uint64
+	queueInFlight                 int
+	queueAttempts, queueMisses    int
+	turnSequence, turnCompletions uint64 // guarded by stateMu
+	turnUnsteerable               bool
+
 	stateMu      sync.Mutex
 	pendingMsgs  []string
 	currentTurn  string
@@ -1019,8 +1029,11 @@ func (s *appServerSession) Alive() bool {
 }
 
 func (s *appServerSession) Close() error {
+	s.queueMu.Lock()
 	s.alive.Store(false)
 	s.cancel()
+	s.queueMu.Unlock()
+	s.clearDeferredMessages("session close/restart")
 
 	s.procMu.Lock()
 	if s.stdin != nil {
@@ -1187,14 +1200,23 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
 			s.stateMu.Lock()
 			s.currentTurn = notif.Turn.ID
+			s.turnSequence++
+			s.turnUnsteerable = false
 			s.pendingMsgs = s.pendingMsgs[:0]
 			s.stateMu.Unlock()
 			s.storeContextUsage(nil)
+			s.signalDeferredMessages()
 		}
 
 	case "item/started":
 		var notif itemNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+			kind, _ := notif.Item["type"].(string)
+			if kind == "enteredReviewMode" || kind == "contextCompaction" {
+				s.stateMu.Lock()
+				s.turnUnsteerable = true
+				s.stateMu.Unlock()
+			}
 			s.handleItemStarted(notif.Item)
 		}
 
@@ -1249,6 +1271,7 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 			s.goalObjective, s.goalStatus, s.goalTokensUsed = "", "", 0
 		}
 		s.goalMu.Unlock()
+		s.signalDeferredMessages()
 
 	case "account/rateLimits/updated":
 		var notif appServerRateLimitsResponse
@@ -1624,6 +1647,7 @@ func (s *appServerSession) completeTurn() {
 		return
 	}
 	s.currentTurn = ""
+	s.turnCompletions++
 	s.stateMu.Unlock()
 	s.flushPendingAsText()
 	s.emit(core.Event{Type: core.EventResult, SessionID: s.CurrentSessionID(), Done: true})
@@ -1631,6 +1655,7 @@ func (s *appServerSession) completeTurn() {
 	// this turn's text has been delivered: codex marks the goal complete a few
 	// seconds before the (check) turn itself completes.
 	s.flushGoalNotice(false)
+	s.signalDeferredMessages()
 }
 
 // ── GoalController ────────────────────────────────────────────
@@ -1679,6 +1704,7 @@ func (s *appServerSession) GetGoal() core.GoalInfo {
 }
 
 func (s *appServerSession) ClearGoal() error {
+	s.ClearMidTurnMessages()
 	threadID := s.CurrentSessionID()
 	if threadID == "" {
 		return fmt.Errorf("codex app-server thread id is empty")
@@ -1718,6 +1744,7 @@ func (s *appServerSession) handleGoalUpdated(g threadGoal) {
 	changed := !strings.EqualFold(s.goalStatus, g.Status)
 	s.goalMu.Unlock()
 	s.storeGoal(g)
+	s.signalDeferredMessages()
 	if !changed {
 		return
 	}

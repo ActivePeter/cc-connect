@@ -508,6 +508,7 @@ type workspaceInitFlow struct {
 // sends it after the current turn completes to avoid mid-turn interference.
 type queuedMessage struct {
 	goalObjective     bool
+	goalAuto          bool
 	goalSeq           uint64
 	messageID         string
 	platform          Platform
@@ -526,6 +527,7 @@ type queuedMessage struct {
 
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
+	deferredMu               sync.Mutex // serializes steer/queue routing and queue cancellation
 	agentSession             AgentSession
 	lastTurnSucceeded        bool
 	platform                 Platform
@@ -3028,6 +3030,12 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		return
 	}
 
+	// A native agent turn (including ordinary restart continuation) owns new
+	// input before always mode can infer another goal. Failed steers are kept
+	// in its in-memory FIFO until a turn/boundary can accept them.
+	if !msg.goalObjective && !strings.HasPrefix(content, "/") && e.handleDeferredMessage(p, msg, interactiveKey, sessions) {
+		return
+	}
 	// Interject into an existing goal before goal_mode=always interprets this
 	// message as a new objective. Automatic goal turns can run after the
 	// foreground session lock has been released. Commands stay on their path.
@@ -3037,6 +3045,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	if e.goalModeAlways && !strings.HasPrefix(content, "/") {
 		if ga, ok := agent.(GoalAwareAgent); ok && ga.SupportsGoalMode() {
 			msg.goalObjective = true
+			msg.goalAuto = true
 		}
 	}
 	if msg.goalObjective {
@@ -3246,6 +3255,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
 		goalObjective:     msg.goalObjective,
+		goalAuto:          msg.goalAuto,
 		goalSeq:           state.goalSeq,
 		messageID:         msg.MessageID,
 		platform:          p,
@@ -6096,7 +6106,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						return
 					}
 					if queued.goalObjective {
-						nextSend <- e.sendQueuedGoal(state, as, queued.goalSeq, queued.content, queued.platform, queued.replyCtx)
+						nextSend <- e.sendQueuedGoal(state, as, queued.goalSeq, queued.content, queued.platform, queued.replyCtx, queued)
 					} else {
 						nextSend <- sendForegroundMessage(state, as, queuedPrompt, queued.messageID, queued.images, queued.files)
 					}
@@ -6431,7 +6441,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 				return
 			}
 			if queued.goalObjective {
-				sendDone <- e.sendQueuedGoal(state, as, queued.goalSeq, queued.content, queued.platform, queued.replyCtx)
+				sendDone <- e.sendQueuedGoal(state, as, queued.goalSeq, queued.content, queued.platform, queued.replyCtx, queued)
 			} else {
 				sendDone <- sendForegroundMessage(state, as, prompt, queued.messageID, queued.images, queued.files)
 			}
@@ -6584,7 +6594,7 @@ func (e *Engine) handleMessageForActiveGoal(p Platform, msg *Message, interactiv
 var errGoalBusy = errors.New("queued goal is busy")
 var errGoalCanceled = errors.New("queued goal canceled")
 
-func (e *Engine) sendQueuedGoal(state *interactiveState, as AgentSession, seq uint64, objective string, p Platform, replyCtx any) error {
+func (e *Engine) sendQueuedGoal(state *interactiveState, as AgentSession, seq uint64, objective string, p Platform, replyCtx any, queued ...queuedMessage) error {
 	state.goalControlMu.Lock()
 	defer state.goalControlMu.Unlock()
 	state.mu.Lock()
@@ -6598,6 +6608,17 @@ func (e *Engine) sendQueuedGoal(state *interactiveState, as AgentSession, seq ui
 		return fmt.Errorf("agent session does not support goals")
 	}
 	running, hasRunning := as.(GoalTurnRunning)
+	if len(queued) > 0 && queued[0].goalAuto {
+		if queue, ok := as.(DeferredMessageSender); ok {
+			state.deferredMu.Lock()
+			defer state.deferredMu.Unlock()
+			q := queued[0]
+			_, sessions := e.sessionContextForKey(q.msgSessionKey)
+			msg := &Message{SessionKey: q.msgSessionKey, Content: q.content, MessageID: q.messageID, ReplyCtx: q.replyCtx, UserID: q.userID, UserName: q.userName, Platform: q.msgPlatform, ChannelKey: q.channelKey}
+			e.enqueueDeferredMessage(p, msg, q.msgSessionKey, state, queue, sessions, false, true)
+			return nil
+		}
+	}
 	if gc.GetGoal().Active() || (hasRunning && running.GoalTurnRunning()) {
 		return errGoalBusy
 	}
@@ -6706,6 +6727,9 @@ func (e *Engine) cmdGoal(p Platform, msg *Message, args []string) bool {
 		}
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf("goal：%s\n状态：%s\n已用 token：%d", info.Objective, info.Status, info.TokensUsed))
 	case strings.EqualFold(arg, "clear"):
+		if n := e.clearDeferredMessageQueue(interactiveKey); n > 0 {
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDeferredQueueCleared, n))
+		}
 		e.interactiveMu.Lock()
 		state := e.interactiveStates[interactiveKey]
 		e.interactiveMu.Unlock()
@@ -10444,6 +10468,9 @@ func (e *Engine) cmdTTS(p Platform, msg *Message, args []string) {
 }
 
 func (e *Engine) cmdStop(p Platform, msg *Message) {
+	if n := e.clearDeferredMessageQueue(e.interactiveKeyForSessionKey(msg.SessionKey)); n > 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDeferredQueueCleared, n))
+	}
 	// /stop only tears down the live agent process; it preserves the stored
 	// AgentSessionID so the next message can --resume the conversation. This
 	// matches the card-button stop path (see executeCardAction "/stop"). The
