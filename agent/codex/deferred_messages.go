@@ -4,17 +4,22 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
 
-const maxDeferredMessages = 64
+const (
+	maxDeferredMessages         = 64
+	deferredIdleWatchdogTimeout = 60 * time.Second
+)
 
 type deferredMessage struct {
 	core.DeferredMessage
 	lastAttempt     uint64
 	afterCompletion uint64
 	epoch           uint64
+	enqueuedAt      time.Time
 }
 
 var _ core.DeferredMessageSender = (*appServerSession)(nil)
@@ -37,7 +42,7 @@ func (s *appServerSession) EnqueueMidTurn(m core.DeferredMessage) error {
 	if len(s.messageQueue)+s.queueInFlight >= maxDeferredMessages {
 		return fmt.Errorf("codex: deferred message queue is full (%d)", maxDeferredMessages)
 	}
-	q := &deferredMessage{DeferredMessage: m, afterCompletion: ended, epoch: s.queueEpoch}
+	q := &deferredMessage{DeferredMessage: m, afterCompletion: ended, epoch: s.queueEpoch, enqueuedAt: time.Now()}
 	if m.Attempted {
 		q.lastAttempt = seq
 	}
@@ -76,9 +81,11 @@ func (s *appServerSession) clearDeferredMessages(reason string) int {
 	pending := s.messageQueue
 	s.messageQueue = nil
 	s.queueEpoch++
+	s.stopDeferredWatchdogLocked()
 	attempts, misses := s.queueAttempts, s.queueMisses
 	s.queueMu.Unlock()
 	s.queueDeliveryMu.Unlock()
+	s.signalDeferredMessages()
 	if len(pending) > 0 {
 		slog.Info("codex deferred messages discarded", "count", len(pending), "reason", reason, "steer_attempts", attempts, "steer_misses", misses)
 	}
@@ -92,14 +99,62 @@ func (s *appServerSession) clearDeferredMessages(reason string) int {
 
 func (s *appServerSession) runDeferredMessages() {
 	defer s.wg.Done()
+	defer s.stopDeferredWatchdog()
 	for {
+		s.queueMu.Lock()
+		var watchdog <-chan time.Time
+		if s.queueWatchdog != nil {
+			watchdog = s.queueWatchdog.C
+		}
+		s.queueMu.Unlock()
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-s.queueWake:
+		case <-watchdog:
 		}
 		for s.deliverDeferredHead() {
 		}
+		s.armDeferredWatchdog()
+	}
+}
+
+// The queue worker owns a single reusable timer. Clearing/starting a turn can
+// stop it synchronously; the buffered wake then makes the worker reevaluate.
+func (s *appServerSession) stopDeferredWatchdogLocked() {
+	if s.queueWatchdog != nil {
+		s.queueWatchdog.Stop()
+	}
+}
+
+func (s *appServerSession) stopDeferredWatchdog() {
+	s.queueMu.Lock()
+	s.stopDeferredWatchdogLocked()
+	s.queueMu.Unlock()
+}
+
+func deferredIdleSince(head *deferredMessage, completed time.Time) time.Time {
+	if completed.After(head.enqueuedAt) {
+		return completed
+	}
+	return head.enqueuedAt
+}
+
+func (s *appServerSession) armDeferredWatchdog() {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	s.stateMu.Lock()
+	turn, completed := s.currentTurn, s.lastTurnCompletedAt
+	s.stateMu.Unlock()
+	if len(s.messageQueue) == 0 || turn != "" || !s.GetGoal().Active() || !s.alive.Load() {
+		s.stopDeferredWatchdogLocked()
+		return
+	}
+	wait := time.Until(deferredIdleSince(s.messageQueue[0], completed).Add(deferredIdleWatchdogTimeout))
+	if s.queueWatchdog == nil {
+		s.queueWatchdog = time.NewTimer(wait)
+	} else {
+		s.queueWatchdog.Reset(wait)
 	}
 }
 
@@ -128,10 +183,13 @@ func (s *appServerSession) dispatchDeferredHead() (bool, func()) {
 	s.queueMu.Unlock()
 	s.stateMu.Lock()
 	turn, seq, ended, blocked := s.currentTurn, s.turnSequence, s.turnCompletions, s.turnUnsteerable
+	completed := s.lastTurnCompletedAt
 	s.stateMu.Unlock()
 	goal := s.GetGoal()
 	attachment := len(head.Images)+len(head.Files) > 0
-	fallback := (!goal.Active() && turn == "") || (attachment && ended > head.afterCompletion)
+	idleSince := deferredIdleSince(head, completed)
+	watchdog := goal.Active() && turn == "" && time.Since(idleSince) >= deferredIdleWatchdogTimeout
+	fallback := watchdog || (!goal.Active() && turn == "") || (attachment && ended > head.afterCompletion)
 	if !fallback && (turn == "" || blocked || attachment || head.lastAttempt == seq) {
 		return false, nil
 	}
@@ -150,6 +208,10 @@ func (s *appServerSession) dispatchDeferredHead() (bool, func()) {
 		s.queueAttempts++
 	}
 	s.queueInFlight += len(batch)
+	if watchdog {
+		s.queueWatchdogTriggers++
+		slog.Warn("codex deferred idle watchdog triggered", "trigger_count", s.queueWatchdogTriggers, "wait_seconds", time.Since(idleSince).Seconds(), "messages", len(batch), "msg_id", head.MessageID)
+	}
 	s.queueMu.Unlock()
 	var err error
 	status := core.DeferredInserted
@@ -167,7 +229,7 @@ func (s *appServerSession) dispatchDeferredHead() (bool, func()) {
 		}
 		// Goal mode only accepts text objectives. Attachments retain ordinary Send
 		// semantics even on always instances, without changing an existing goal.
-		if asGoal && !goal.Active() && len(images)+len(files) == 0 {
+		if asGoal && !watchdog && !goal.Active() && len(images)+len(files) == 0 {
 			_, err = s.SetGoal(strings.Join(objectives, "\n\n"))
 		} else {
 			err = s.Send(strings.Join(prompts, "\n\n"), head.MessageID, images, files)

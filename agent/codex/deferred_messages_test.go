@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -288,4 +289,173 @@ func TestDeferredQueue_ClearWaitsForInFlightFallback(t *testing.T) {
 	if strings.Join(methods, ",") != "thread/goal/set,thread/goal/clear" {
 		t.Fatal(methods)
 	}
+}
+
+func TestDeferredWatchdog_ActiveGoalGapUsesLaterEnqueueOrCompletion(t *testing.T) {
+	for _, timing := range []string{"enqueue_after_completion", "completion_after_enqueue"} {
+		t.Run(timing, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, r := newDeferredRPC(t)
+				if timing == "enqueue_after_completion" {
+					s.completeTurn()
+					time.Sleep(20 * time.Second)
+				}
+				out := make(chan string, 2)
+				for _, text := range []string{"one", "two"} {
+					if err := s.EnqueueMidTurn(core.DeferredMessage{Prompt: text, GoalObjective: text, AsGoal: true, Attempted: true, Notify: deferredNotify(out)}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				synctest.Wait()
+				if timing == "completion_after_enqueue" {
+					time.Sleep(20 * time.Second)
+					s.completeTurn()
+					synctest.Wait()
+				}
+				time.Sleep(60*time.Second - time.Nanosecond)
+				synctest.Wait()
+				if methods, _ := r.snapshot(); len(methods) != 0 {
+					t.Fatalf("fallback too early: %v", methods)
+				}
+				time.Sleep(time.Nanosecond)
+				synctest.Wait()
+				awaitDeferred(t, out, core.DeferredSent)
+				awaitDeferred(t, out, core.DeferredSent)
+				methods, texts := r.snapshot()
+				if strings.Join(methods, ",") != "turn/start" || len(texts) != 1 || texts[0] != "one\n\ntwo" {
+					t.Fatalf("methods=%v texts=%v", methods, texts)
+				}
+				if goal := s.GetGoal(); !goal.Active() || goal.Objective != "original" {
+					t.Fatalf("watchdog changed goal: %+v", goal)
+				}
+				s.queueMu.Lock()
+				triggers := s.queueWatchdogTriggers
+				s.queueMu.Unlock()
+				if triggers != 1 || s.PendingMidTurnMessages() != 0 {
+					t.Fatalf("triggers=%d pending=%d", triggers, s.PendingMidTurnMessages())
+				}
+			})
+		})
+	}
+}
+
+func TestDeferredWatchdog_TurnStartsBeforeDeadlineInserts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, r := newDeferredRPC(t)
+		s.currentTurn = ""
+		out := make(chan string, 1)
+		if err := s.EnqueueMidTurn(core.DeferredMessage{Prompt: "marker", Attempted: true, AsGoal: true, Notify: deferredNotify(out)}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		time.Sleep(59 * time.Second)
+		startDeferredTurn(s, "next-turn")
+		synctest.Wait()
+		awaitDeferred(t, out, core.DeferredInserted)
+		time.Sleep(2 * time.Minute)
+		synctest.Wait()
+		if methods, _ := r.snapshot(); strings.Join(methods, ",") != "turn/steer" {
+			t.Fatal(methods)
+		}
+		s.queueMu.Lock()
+		triggers := s.queueWatchdogTriggers
+		s.queueMu.Unlock()
+		if triggers != 0 {
+			t.Fatalf("watchdog fired during a turn: %d", triggers)
+		}
+	})
+}
+
+func TestDeferredWatchdog_NewTurnResetsWaitAfterRejectedSteer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, r := newDeferredRPC(t)
+		s.currentTurn = ""
+		r.reject["blocked-turn"] = true
+		out := make(chan string, 1)
+		_ = s.EnqueueMidTurn(core.DeferredMessage{Prompt: "marker", AsGoal: true, Attempted: true, Notify: deferredNotify(out)})
+		synctest.Wait()
+		time.Sleep(59 * time.Second)
+		startDeferredTurn(s, "blocked-turn")
+		synctest.Wait()
+		time.Sleep(30 * time.Second)
+		synctest.Wait()
+		if methods, _ := r.snapshot(); strings.Join(methods, ",") != "turn/steer" {
+			t.Fatalf("sent during turn: %v", methods)
+		}
+		s.completeTurn()
+		synctest.Wait()
+		time.Sleep(60*time.Second - time.Nanosecond)
+		synctest.Wait()
+		if methods, _ := r.snapshot(); strings.Join(methods, ",") != "turn/steer" {
+			t.Fatalf("wait was not reset: %v", methods)
+		}
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		awaitDeferred(t, out, core.DeferredSent)
+		if methods, _ := r.snapshot(); strings.Join(methods, ",") != "turn/steer,turn/start" {
+			t.Fatal(methods)
+		}
+	})
+}
+
+func TestDeferredWatchdog_ClearAndCloseStopTimer(t *testing.T) {
+	for _, action := range []string{"clear", "close"} {
+		t.Run(action, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, r := newDeferredRPC(t)
+				s.currentTurn = ""
+				out := make(chan string, 1)
+				_ = s.EnqueueMidTurn(core.DeferredMessage{Prompt: "cancel me", Attempted: true, Notify: deferredNotify(out)})
+				synctest.Wait()
+				time.Sleep(59 * time.Second)
+				if action == "clear" {
+					if n := s.ClearMidTurnMessages(); n != 1 {
+						t.Fatal(n)
+					}
+				} else if err := s.Close(); err != nil {
+					t.Fatal(err)
+				}
+				awaitDeferred(t, out, core.DeferredCanceled)
+				s.queueMu.Lock()
+				active := s.queueWatchdog != nil && s.queueWatchdog.Stop()
+				s.queueMu.Unlock()
+				if active {
+					t.Fatal("timer was not stopped")
+				}
+				synctest.Wait()
+				time.Sleep(2 * time.Minute)
+				synctest.Wait()
+				if methods, _ := r.snapshot(); len(methods) != 0 {
+					t.Fatalf("sent canceled input: %v", methods)
+				}
+				if s.PendingMidTurnMessages() != 0 {
+					t.Fatal("pending after cancellation")
+				}
+			})
+		})
+	}
+}
+
+func TestDeferredWatchdog_SendFailureReportsEveryMessage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, r := newDeferredRPC(t)
+		s.currentTurn = ""
+		r.failMethod = "turn/start"
+		out := make(chan string, 2)
+		for _, text := range []string{"one", "two"} {
+			_ = s.EnqueueMidTurn(core.DeferredMessage{Prompt: text, AsGoal: true, Attempted: true, Notify: deferredNotify(out)})
+		}
+		synctest.Wait()
+		time.Sleep(60 * time.Second)
+		synctest.Wait()
+		for range 2 {
+			awaitDeferred(t, out, "codex app-server turn/start: cannot steer this turn")
+		}
+		if s.PendingMidTurnMessages() != 0 || !s.GetGoal().Active() {
+			t.Fatal("failed fallback lost goal or hung")
+		}
+		if methods, _ := r.snapshot(); strings.Join(methods, ",") != "turn/start" {
+			t.Fatal(methods)
+		}
+	})
 }

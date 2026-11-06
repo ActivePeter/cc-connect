@@ -208,8 +208,11 @@ type appServerSession struct {
 	queueEpoch                    uint64
 	queueInFlight                 int
 	queueAttempts, queueMisses    int
+	queueWatchdog                 *time.Timer // guarded by queueMu
+	queueWatchdogTriggers         int
 	turnSequence, turnCompletions uint64 // guarded by stateMu
 	turnUnsteerable               bool
+	lastTurnCompletedAt           time.Time // guarded by stateMu
 
 	stateMu      sync.Mutex
 	pendingMsgs  []string
@@ -1205,6 +1208,7 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 			s.pendingMsgs = s.pendingMsgs[:0]
 			s.stateMu.Unlock()
 			s.storeContextUsage(nil)
+			s.stopDeferredWatchdog()
 			s.signalDeferredMessages()
 		}
 
@@ -1648,6 +1652,7 @@ func (s *appServerSession) completeTurn() {
 	}
 	s.currentTurn = ""
 	s.turnCompletions++
+	s.lastTurnCompletedAt = time.Now()
 	s.stateMu.Unlock()
 	s.flushPendingAsText()
 	s.emit(core.Event{Type: core.EventResult, SessionID: s.CurrentSessionID(), Done: true})
