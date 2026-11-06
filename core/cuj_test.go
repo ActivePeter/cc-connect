@@ -2514,3 +2514,24 @@ func TestCUJ_N2_UserMessagesInterjectIntoRunningTurn(t *testing.T) {
 	as.events <- Event{Type: EventResult, Content: "Next task finished", Done: true}
 	env.waitFor("next normal request completes", 3*time.Second, func() bool { return env.sentContains("Next task finished") })
 }
+
+// Interjecting in goal_mode=always must not replace the objective or consume
+// commands; status, clear, and stop retain their ordinary user-facing behavior.
+func TestCUJ_GoalSteer_InterjectStatusClearStop(t *testing.T) {
+	e, p, as, key := goalInjectFixture(t, true, false)
+	sendText(e, p, key, "remember this correction")
+	sendText(e, p, key, "/goal")
+	sendText(e, p, key, "/goal clear")
+	sendText(e, p, key, "/stop")
+	got := p.getSent()
+	if len(got) != 4 || got[0] != e.i18n.T(MsgMessageInjected) || !strings.Contains(got[1], "finish original goal") || !strings.Contains(got[2], "goal 已清除") {
+		t.Fatalf("replies: %v", got)
+	}
+	if len(as.injected) != 1 {
+		t.Fatalf("commands injected: %v", as.injected)
+	}
+	if info, clears, sets := as.state(); info.Active() || clears != 1 || sets != 0 {
+		t.Fatalf("goal: %v clear=%d set=%d", info, clears, sets)
+	}
+	waitFor(t, func() bool { return !as.Alive() }, 2*time.Second)
+}

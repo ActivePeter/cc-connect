@@ -556,6 +556,42 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	return nil
 }
 
+// SendMidTurn appends text to the active turn without starting a new turn or
+// mutating its goal. expectedTurnId makes a concurrent turn transition fail
+// explicitly rather than delivering the message to an unintended turn.
+func (s *appServerSession) SendMidTurn(prompt, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
+	if !s.alive.Load() {
+		return fmt.Errorf("codex app-server: session is closed")
+	}
+	if len(images) > 0 || len(files) > 0 {
+		return fmt.Errorf("codex app-server turn/steer: attachments require a separate turn")
+	}
+	threadID := s.CurrentSessionID()
+	if threadID == "" {
+		return fmt.Errorf("codex app-server turn/steer: thread id is empty")
+	}
+	s.stateMu.Lock()
+	turnID := s.currentTurn
+	s.stateMu.Unlock()
+	if turnID == "" {
+		return fmt.Errorf("codex app-server turn/steer: no active turn to steer")
+	}
+	// Do not hold stateMu over RPC: the notification reader must be able to
+	// advance currentTurn while the response is in flight. Review/compact
+	// turns and stale ids are rejected by app-server and surfaced unchanged.
+	params := map[string]any{
+		"threadId":       threadID,
+		"expectedTurnId": turnID,
+		"input":          []map[string]any{{"type": "text", "text": prompt, "text_elements": []any{}}},
+	}
+	if err := s.request("turn/steer", params, nil); err != nil {
+		return fmt.Errorf("codex app-server turn/steer: %w", err)
+	}
+	return nil
+}
+
+var _ core.MidTurnMessageSender = (*appServerSession)(nil)
+
 func (s *appServerSession) stageImages(prompt string, images []core.ImageAttachment) (string, []string, error) {
 	if len(images) == 0 {
 		return prompt, nil, nil

@@ -3028,9 +3028,12 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		return
 	}
 
-	// A goal that is still being pursued owns the session: answer the message
-	// without handing it to the agent. Commands (including /goal and /stop)
-	// were already handled above.
+	// Interject into an existing goal before goal_mode=always interprets this
+	// message as a new objective. Automatic goal turns can run after the
+	// foreground session lock has been released. Commands stay on their path.
+	if !msg.goalObjective && !strings.HasPrefix(content, "/") && e.handleMessageForActiveGoal(p, msg, interactiveKey, sessions) {
+		return
+	}
 	if e.goalModeAlways && !strings.HasPrefix(content, "/") {
 		if ga, ok := agent.(GoalAwareAgent); ok && ga.SupportsGoalMode() {
 			msg.goalObjective = true
@@ -6553,10 +6556,16 @@ func (e *Engine) liveGoalController(interactiveKey string) GoalController {
 	return gc
 }
 
-// blockMessageForActiveGoal answers an ordinary message without handing it to
-// the agent while a goal is still running. Codex starts its next goal round
-// milliseconds after a turn ends, so there is no window to queue into safely.
+// blockMessageForActiveGoal retains the command/queued-message rejection path.
 func (e *Engine) blockMessageForActiveGoal(p Platform, msg *Message, interactiveKey string) bool {
+	return e.handleMessageForActiveGoal(p, msg, interactiveKey, nil)
+}
+
+// handleMessageForActiveGoal tries mid-turn delivery for incoming platform text,
+// including autonomous goal turns. On failure, retain the explicit rejection;
+// never queue a new foreground turn alongside automatic continuation or
+// acknowledge a message the agent did not accept.
+func (e *Engine) handleMessageForActiveGoal(p Platform, msg *Message, interactiveKey string, sessions *SessionManager) bool {
 	gc := e.liveGoalController(interactiveKey)
 	if gc == nil {
 		return false
@@ -6564,6 +6573,9 @@ func (e *Engine) blockMessageForActiveGoal(p Platform, msg *Message, interactive
 	info := gc.GetGoal()
 	if !info.Active() {
 		return false
+	}
+	if sessions != nil && len(msg.Images) == 0 && len(msg.Files) == 0 && e.injectUserMessageForBusySession(p, msg, interactiveKey, sessions.GetOrCreateActive(msg.SessionKey), sessions) {
+		return true
 	}
 	e.reply(p, msg.ReplyCtx, fmt.Sprintf("goal 进行中：%s\n等它达成，或先发 /goal clear，再发新消息。", info.Objective))
 	return true

@@ -27,8 +27,8 @@ var ErrInjectUnsupported = errors.New("agent does not support mid-turn injection
 // write, the message starts a turn of its own that the unsolicited reader
 // relays like any between-turn output.
 //
-// When no foreground turn is running it returns InjectIdle and writes
-// nothing; the caller then delivers the message through the normal path
+// When neither a foreground nor an autonomous goal turn is running it returns
+// InjectIdle and writes nothing; the caller then delivers through the normal path
 // (a timer), which starts a turn properly.
 func (e *Engine) InjectToBusySession(sessionKey, prompt string) (string, error) {
 	if sessionKey == "" || prompt == "" {
@@ -36,9 +36,9 @@ func (e *Engine) InjectToBusySession(sessionKey, prompt string) (string, error) 
 	}
 	_, sessions := e.sessionContextForKey(sessionKey)
 	session := sessions.GetOrCreateActive(sessionKey)
-	if session.TryLock() {
+	foregroundBusy := !session.TryLock()
+	if !foregroundBusy {
 		session.UnlockWithoutUpdate()
-		return InjectIdle, nil
 	}
 
 	iKey := e.interactiveKeyForSessionKey(sessionKey)
@@ -56,6 +56,10 @@ func (e *Engine) InjectToBusySession(sessionKey, prompt string) (string, error) 
 	}
 
 	state.mu.Lock()
+	if !foregroundBusy && !activeGoalTurnRunning(state.agentSession) {
+		state.mu.Unlock()
+		return InjectIdle, nil
+	}
 	status, err := injectIntoStateLocked(state, prompt, "", nil, nil)
 	state.mu.Unlock()
 	if err != nil || status != InjectInjected {
@@ -76,13 +80,21 @@ func injectIntoStateLocked(state *interactiveState, prompt, messageID string, im
 	if !ok {
 		return "", ErrInjectUnsupported
 	}
-	if !state.midTurnReady {
+	if !state.midTurnReady && !activeGoalTurnRunning(state.agentSession) {
 		return InjectIdle, nil
 	}
 	if err := sender.SendMidTurn(prompt, messageID, images, files); err != nil {
 		return "", fmt.Errorf("inject: %w", err)
 	}
 	return InjectInjected, nil
+}
+
+// activeGoalTurnRunning distinguishes an autonomous goal turn from idle or
+// foreground startup, without enabling injection before an ordinary first Send.
+func activeGoalTurnRunning(as AgentSession) bool {
+	gc, hasGoal := as.(GoalController)
+	running, hasRunning := as.(GoalTurnRunning)
+	return hasGoal && hasRunning && gc.GetGoal().Active() && running.GoalTurnRunning()
 }
 
 // sendForegroundMessage arms injection only after the initial input has been
