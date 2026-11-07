@@ -346,6 +346,11 @@ type RateLimitCfg struct {
 
 // Engine routes messages between platforms and the agent for a single project.
 type Engine struct {
+	rotationLifecycle     map[string]int
+	rotationGeneration    map[string]uint64
+	rotationMu            sync.Mutex
+	rotationWorkers       map[string]bool
+	sessionSpawnMu        sync.Mutex
 	name                  string
 	agent                 Agent
 	platforms             []Platform
@@ -519,6 +524,11 @@ type queuedMessage struct {
 
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
+	rotationRouteKey         string
+	rotationRecovery         bool
+	rotationOutcome          rotationTurnOutcome
+	rotationCandidate        bool
+	logicalSessionID         string
 	agentSession             AgentSession
 	lastTurnSucceeded        bool
 	platform                 Platform
@@ -3249,7 +3259,14 @@ func (e *Engine) drainOrphanedQueue(session *Session, sessions *SessionManager, 
 	unlocked := false
 	defer func() {
 		if !unlocked {
+			e.rotationMu.Lock()
+			if op, ok := sessions.PendingRotation(sessions.KeyForSession(session.ID), session.ID); ok {
+				if err := sessions.FinishRotation(op.RequestID, "FAILED", "turn ended before final reply confirmation"); err != nil {
+					slog.Error("rotation early-return receipt", "error", err)
+				}
+			}
 			session.Unlock()
+			e.rotationMu.Unlock()
 		}
 	}()
 
@@ -3708,7 +3725,18 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	unlocked := false
 	defer func() {
 		if !unlocked {
+			if msg.rotationState != nil {
+				e.releaseRotationReservation(session, sessions, interactiveKey)
+				return
+			}
+			e.rotationMu.Lock()
+			if op, ok := sessions.PendingRotation(msg.SessionKey, session.ID); ok {
+				if err := sessions.FinishRotation(op.RequestID, "FAILED", "turn ended before final reply confirmation"); err != nil {
+					slog.Error("rotation early-return receipt", "error", err)
+				}
+			}
 			session.Unlock()
+			e.rotationMu.Unlock()
 		}
 	}()
 
@@ -3717,6 +3745,18 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 
 	turnStart := time.Now()
+	if first := session.FirstInput(); first != nil && first.State != "accepted" {
+		if first.State != "pending" {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgRotationUncertain))
+			return
+		}
+		cp := *msg
+		if msg.rotationState == nil {
+			cp.Content = first.Text + "\n\n" + msg.Content
+		}
+		msg = &cp
+
+	}
 
 	e.i18n.DetectAndSet(msg.Content)
 	session.AddHistory("user", msg.Content)
@@ -3730,7 +3770,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if agent != e.agent {
 		agentOverride = agent
 	}
-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
+	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, msg.rotationState)
 
 	// Set workspaceDir on the state for idle reaper identification
 	if workspaceDir != "" {
@@ -3746,6 +3786,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		state.lastRecallProbeAt = time.Time{}
 		state.recallProbeInFlight = false
 	}
+	state.rotationRouteKey = msg.SessionKey
 	state.platform = p
 	state.replyCtx = msg.ReplyCtx
 	state.currentMessageID = msg.MessageID
@@ -3755,6 +3796,10 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	defer stopRecallMonitor()
 
 	if state.agentSession == nil {
+		if msg.rotationState != nil {
+			slog.Info("rotation handoff cancelled before Send", "session", session.ID)
+			return
+		}
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
 		return
 	}
@@ -3820,6 +3865,13 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	as := state.agentSession // capture under lock to avoid race with cleanup
 	state.mu.Unlock()
 
+	if first := session.FirstInput(); first != nil && first.State == "pending" {
+		if err := sessions.SetFirstInputState(session, "in_flight"); err != nil {
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+			return
+		}
+	}
+
 	// Run Send concurrently with processInteractiveEvents. Some agents block inside
 	// Send until the prompt turn finishes (e.g. ACP session/prompt); they may emit
 	// EventPermissionRequest while blocked — the event loop must run in parallel.
@@ -3829,7 +3881,20 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			sendDone <- fmt.Errorf("agent session became nil")
 			return
 		}
-		sendDone <- sendForegroundMessage(state, as, promptContent, msg.MessageID, msg.Images, msg.Files)
+		err := sendForegroundMessage(state, as, promptContent, msg.MessageID, msg.Images, msg.Files)
+		if first := session.FirstInput(); first != nil && first.State == "in_flight" {
+			receipt := "accepted"
+			if err != nil {
+				receipt = "uncertain"
+			}
+			if saveErr := sessions.SetFirstInputState(session, receipt); saveErr != nil {
+				slog.Error("rotation outbox receipt failed", "session", session.ID, "error", saveErr)
+				if err == nil {
+					err = saveErr
+				}
+			}
+		}
+		sendDone <- err
 	}()
 
 	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
@@ -3837,6 +3902,9 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
 	stopTyping = nil // ownership transferred; prevent defer from double-stopping
+	if e.finishScheduledRotation(state, session, sessions, interactiveKey, workspaceDir, ccSessionKey) {
+		return
+	}
 
 	// Start unsolicited reader and arm the idle close timer BEFORE draining
 	// queued messages. drainPendingMessages releases the session lock, and
@@ -4005,11 +4073,14 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 
 // When agentOverride is non-nil it is used instead of e.agent to start the session.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string) *interactiveState {
+func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, expected ...*interactiveState) *interactiveState {
 	e.interactiveMu.Lock()
 	defer e.interactiveMu.Unlock()
 
 	state, ok := e.interactiveStates[sessionKey]
+	if len(expected) > 0 && expected[0] != nil && (state != expected[0] || state.isStopped() || state.agentSession == nil || !state.agentSession.Alive()) {
+		return &interactiveState{platform: p, replyCtx: replyCtx, stopped: true}
+	}
 	if ok && state.agentSession != nil && state.agentSession.Alive() {
 		// Verify the running agent session matches the current active session.
 		// After /new or /switch the active session changes, but the old agent
@@ -4023,6 +4094,13 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		// If wantID is empty (/new, cleared session) but the process already has
 		// a concrete ID, reusing would keep --resume context — recycle (#238).
 		needRecycle := currentID != "" && (wantID == "" || wantID != currentID)
+		state.mu.Lock()
+		candidate := state.rotationCandidate && state.logicalSessionID == session.ID
+		state.rotationCandidate = false
+		state.mu.Unlock()
+		if candidate {
+			needRecycle = false
+		}
 		if !needRecycle {
 			return state
 		}
@@ -4052,25 +4130,9 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		ccKey = ccSessionKey
 	}
 
-	// Inject per-session env vars so the agent subprocess can call `cc-connect cron add` etc.
-	if inj, ok := agent.(SessionEnvInjector); ok {
-		envVars := []string{
-			"CC_PROJECT=" + e.name,
-			"CC_SESSION_KEY=" + ccKey,
-		}
-		if e.dataDir != "" {
-			envVars = append(envVars, "CC_DATA_DIR="+e.dataDir)
-		}
-		if exePath, err := os.Executable(); err == nil {
-			binDir := filepath.Dir(exePath)
-			if curPath := os.Getenv("PATH"); curPath != "" {
-				envVars = append(envVars, "PATH="+binDir+string(filepath.ListSeparator)+curPath)
-			} else {
-				envVars = append(envVars, "PATH="+binDir)
-			}
-		}
-		inj.SetSessionEnv(envVars)
-	}
+	e.sessionSpawnMu.Lock()
+	defer e.sessionSpawnMu.Unlock()
+	e.injectRotationEnv(agent, ccKey, session.ID, sessions.RotationScope())
 
 	// Inject platform-specific formatting instructions into the agent's system prompt.
 	// Clear the prompt first so instructions from a previous platform don't leak
@@ -4106,6 +4168,9 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// is unbound, force a fresh start instead of attaching to whichever CLI
 	// conversation happens to be "latest" in this workspace.
 	startSessionID := session.GetAgentSessionID()
+	if sessions.IsRetiredAgentID(startSessionID) {
+		startSessionID = ""
+	}
 	// Cross-project session leakage guard (issue #599): if a session ID was
 	// inherited from a different project's workspace (e.g. another
 	// cc-connect project that happens to share a Session row), the agent
@@ -4188,6 +4253,8 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 
 	newState := &interactiveState{
+		logicalSessionID: session.ID,
+		rotationRouteKey: ccKey,
 		agentSession:     agentSession,
 		platform:         p,
 		replyCtx:         replyCtx,
@@ -4223,6 +4290,9 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 // to avoid race conditions where concurrent requests see an empty map while the
 // agent session is still being shut down (which can take up to 130s for Stop hooks).
 func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interactiveState) {
+	if len(expected) == 0 {
+		e.cancelScheduledRotation(sessionKey, "session lifecycle changed")
+	}
 	e.interactiveMu.Lock()
 	state, ok := e.interactiveStates[sessionKey]
 	if len(expected) > 0 && expected[0] != nil && state != expected[0] {
@@ -4778,6 +4848,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	}
 	state.mu.Lock()
 	state.lastTurnSucceeded = false
+	state.rotationOutcome = rotationTurnOutcome{}
 	turnPlatform := state.platform.Name()
 	state.mu.Unlock()
 	turnEvent := e.beginTurnHook(session, sessionKey, turnPlatform, input)
@@ -4832,8 +4903,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	workspaceRenderer := func(content string) string {
 		return e.renderOutgoingContentForWorkspace(state.platform, content, workspaceDir)
 	}
+	var turnSendsFailed atomic.Bool
+	unconfirmedPreviewSegment := false
 	sendWorkspace := func(p Platform, replyCtx any, content string) {
-		e.sendForWorkspace(p, replyCtx, content, workspaceDir)
+		if err := e.sendWithErrorForWorkspace(p, replyCtx, content, workspaceDir); err != nil {
+			turnSendsFailed.Store(true)
+		}
 	}
 	sendWorkspaceWithError := func(p Platform, replyCtx any, content string) error {
 		return e.sendWithErrorForWorkspace(p, replyCtx, content, workspaceDir)
@@ -5084,6 +5159,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				} else {
 					if sp.canPreview() {
 						sp.freeze()
+						unconfirmedPreviewSegment = true
 						sp.detachPreview()
 					} else {
 						segment := strings.Join(textParts[segmentStart:], "")
@@ -5121,6 +5197,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				sp.freeze()
 				if previewActive {
+					unconfirmedPreviewSegment = true
 					sp.detachPreview() // keep frozen preview visible as permanent message
 				}
 				preview := truncateIf(event.Content, e.display.ThinkingMaxLen)
@@ -5171,6 +5248,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				} else {
 					if sp.canPreview() {
 						sp.freeze()
+						unconfirmedPreviewSegment = true
 						sp.detachPreview()
 					} else {
 						segment := strings.Join(textParts[segmentStart:], "")
@@ -5229,6 +5307,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				sp.freeze()
 				if previewActive {
+					unconfirmedPreviewSegment = true
 					sp.detachPreview() // keep frozen preview visible as permanent message
 				}
 				toolInput := event.ToolInput
@@ -5481,6 +5560,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 			sp.freeze()
 			if previewActive {
+				unconfirmedPreviewSegment = true
 				sp.detachPreview() // keep frozen preview visible as permanent message
 			}
 
@@ -5893,6 +5973,36 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.lastTurnSucceeded = true
 			state.mu.Unlock()
 
+			deliveryErr := error(nil)
+			if pendingSend != nil {
+				select {
+				case deliveryErr = <-pendingSend:
+					pendingSend = nil
+				case <-time.After(5 * time.Second):
+					deliveryErr = fmt.Errorf("agent Send acknowledgement timed out")
+				case <-e.ctx.Done():
+					deliveryErr = e.ctx.Err()
+				}
+			}
+			safeRotation := deliveryErr == nil && !turnSendsFailed.Load() && !unconfirmedPreviewSegment
+			if !isSilent && e.tts != nil && e.tts.Enabled && e.tts.TTS != nil {
+				safeRotation = false
+			}
+			if isSilent && hasRichCard {
+				safeRotation = false
+			}
+			if hasRichCard && cardMessageID != nil {
+				if _, ok := p.(MessageUpdater); !ok {
+					safeRotation = false
+				}
+			}
+			state.mu.Lock()
+			state.rotationOutcome = rotationTurnOutcome{Complete: true, Delivered: safeRotation}
+			state.mu.Unlock()
+			if _, pending := sessions.PendingRotation(sessions.KeyForSession(session.ID), session.ID); pending {
+				return
+			}
+
 			// Auto-compress after finishing a turn, before sending any queued messages.
 			if triggerAutoCompress {
 				compressor, ok := e.agent.(ContextCompressor)
@@ -6028,6 +6138,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				cardToolCalls = nil
 				cardThinkingText = ""
 				cardAnswerText.Reset()
+				turnSendsFailed.Store(false)
+				unconfirmedPreviewSegment = false
 
 				// Try to create a new streaming card for the queued turn
 				if scp, ok := queued.platform.(StreamingCardPlatform); ok {
@@ -6259,11 +6371,30 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 // state.mu) to close the race window between "queue empty" and "session unlocked".
 // Returns true if the session was unlocked by this call.
 func (e *Engine) drainPendingMessages(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string) bool {
+	state.mu.Lock()
+	recoverQueue := state.rotationRecovery && !state.stopped && len(state.pendingMessages) > 0
+	state.mu.Unlock()
+	if recoverQueue && e.processRotationFailureQueue(state, session, sessions, sessionKey) {
+		return true
+	}
+
+	rotationTried := false
 	for {
+		e.rotationMu.Lock()
+		if _, pending := sessions.PendingRotation(sessions.KeyForSession(session.ID), session.ID); pending && !rotationTried {
+			e.rotationMu.Unlock()
+			if e.finishScheduledRotation(state, session, sessions, sessionKey, state.workspaceDir, sessions.KeyForSession(session.ID)) {
+				session.Unlock()
+				return true
+			}
+			rotationTried = true
+			e.rotationMu.Lock()
+		}
 		state.mu.Lock()
 		if len(state.pendingMessages) == 0 {
 			session.Unlock()
 			state.mu.Unlock()
+			e.rotationMu.Unlock()
 			return true
 		}
 		droppedStale := 0
@@ -6280,8 +6411,10 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		if len(state.pendingMessages) == 0 {
 			session.Unlock()
 			state.mu.Unlock()
+			e.rotationMu.Unlock()
 			return true
 		}
+		e.rotationMu.Unlock()
 		queued := state.pendingMessages[0]
 		state.pendingMessages = state.pendingMessages[1:]
 		state.platform = queued.platform
@@ -6323,6 +6456,10 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 
 		slog.Info("processing queued message", "session", sessionKey)
 		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx)
+		if e.finishScheduledRotation(state, session, sessions, sessionKey, state.workspaceDir, queued.msgSessionKey) {
+			session.Unlock()
+			return true
+		}
 	}
 }
 
@@ -6665,6 +6802,10 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 }
 
 func (e *Engine) handleWorkspaceCommand(p Platform, msg *Message, args []string) {
+	if len(args) > 0 {
+		done := e.beginRotationLifecycle(msg.SessionKey)
+		defer done()
+	}
 	channelID := effectiveChannelID(msg)
 	channelKey := effectiveWorkspaceChannelKey(msg)
 	projectKey := "project:" + e.name
@@ -6904,6 +7045,10 @@ func (e *Engine) handleWorkspaceCommand(p Platform, msg *Message, args []string)
 }
 
 func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
+	if true {
+		done := e.beginRotationLifecycle(msg.SessionKey)
+		defer done()
+	}
 	_, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
@@ -6936,6 +7081,13 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 // filter_external_sessions config. When disabled (default), all sessions are
 // returned. When enabled, only sessions tracked by cc-connect are shown.
 func (e *Engine) applySessionFilter(sessions []AgentSessionInfo, sm *SessionManager) []AgentSessionInfo {
+	live := make([]AgentSessionInfo, 0, len(sessions))
+	for _, item := range sessions {
+		if !sm.IsRetiredAgentID(item.ID) {
+			live = append(live, item)
+		}
+	}
+	sessions = live
 	if !e.filterExternalSessions {
 		return sessions
 	}
@@ -7057,6 +7209,10 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 }
 
 func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
+	if true {
+		done := e.beginRotationLifecycle(msg.SessionKey)
+		defer done()
+	}
 	if len(args) == 0 {
 		e.reply(p, msg.ReplyCtx, "Usage: /switch <number | id_prefix | name>")
 		return
@@ -9591,6 +9747,10 @@ func sanitizeTelegramMenuCommand(cmd string) string {
 }
 
 func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
+	if len(args) > 0 {
+		done := e.beginRotationLifecycle(msg.SessionKey)
+		defer done()
+	}
 	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
@@ -9806,6 +9966,10 @@ func (e *Engine) switchModelOnAgent(agent Agent, target string, persistConfig bo
 }
 
 func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
+	if len(args) > 0 {
+		done := e.beginRotationLifecycle(msg.SessionKey)
+		defer done()
+	}
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
@@ -9893,6 +10057,10 @@ func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
 }
 
 func (e *Engine) cmdMode(p Platform, msg *Message, args []string) {
+	if len(args) > 0 {
+		done := e.beginRotationLifecycle(msg.SessionKey)
+		defer done()
+	}
 	agent, _, _, err := e.commandContext(p, msg)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
@@ -10111,6 +10279,10 @@ func (e *Engine) cmdStop(p Platform, msg *Message) {
 // Unlike /stop which only halts execution, /cancel also resets the session
 // so the user can immediately continue with new instructions.
 func (e *Engine) cmdCancel(p Platform, msg *Message) {
+	if true {
+		done := e.beginRotationLifecycle(msg.SessionKey)
+		defer done()
+	}
 	_, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
@@ -10147,6 +10319,9 @@ func (e *Engine) stopInteractiveSessionSilently(sessionKey string) bool {
 }
 
 func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueued bool) bool {
+	done := e.beginRotationLifecycle(e.rotationMessageKey(sessionKey))
+	defer done()
+	e.cancelScheduledRotation(sessionKey, "stopped by user")
 	e.interactiveMu.Lock()
 	state, ok := e.interactiveStates[sessionKey]
 	if !ok || state == nil {
@@ -10484,6 +10659,10 @@ func (e *Engine) cmdAllow(p Platform, msg *Message, args []string) {
 }
 
 func (e *Engine) cmdProvider(p Platform, msg *Message, args []string) {
+	if len(args) > 0 {
+		done := e.beginRotationLifecycle(msg.SessionKey)
+		defer done()
+	}
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))

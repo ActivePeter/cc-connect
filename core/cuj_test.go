@@ -2514,3 +2514,44 @@ func TestCUJ_N2_UserMessagesInterjectIntoRunningTurn(t *testing.T) {
 	as.events <- Event{Type: EventResult, Content: "Next task finished", Done: true}
 	env.waitFor("next normal request completes", 3*time.Second, func() bool { return env.sentContains("Next task finished") })
 }
+
+func TestCUJ_R1_SelfRotationReplyBeforeHandoffAndQueuedInput(t *testing.T) {
+	e, a, p, old := rotStart(t)
+	p.entered = make(chan struct{})
+	p.release = make(chan struct{})
+	req := RotateRequest{SessionKey: "test:chat:user", ExpectedSessionID: old.ID, RequestID: "r", Handoff: "SECRET_HANDOFF"}
+	op, err := e.ScheduleRotation(req)
+	if err != nil || op.Status != "SCHEDULED" {
+		t.Fatal(op, err)
+	}
+	e.ReceiveMessage(p, &Message{Platform: "test", SessionKey: req.SessionKey, Content: "QUEUED", ReplyCtx: "chat", MessageID: "queued-platform-id"})
+	a.at(0).events <- Event{Type: EventResult, Done: true, Content: "A_DONE"}
+	<-p.entered
+	if a.count() != 1 || e.sessions.LookupActive(req.SessionKey) != old {
+		t.Fatal("switched before platform accepted reply")
+	}
+	close(p.release)
+	rotWait(t, func() bool { return a.at(1) != nil && len(a.at(1).sent()) >= 2 })
+	sent := a.at(1).sent()
+	a.at(1).mu.Lock()
+	ids := append([]string(nil), a.at(1).messageIDs...)
+	a.at(1).mu.Unlock()
+	if ids[0] != "" || ids[1] != "queued-platform-id" {
+		t.Fatal("internal handoff claimed a platform message ID", ids)
+	}
+	if !strings.Contains(sent[0], "SECRET_HANDOFF") || !strings.Contains(sent[1], "QUEUED") {
+		t.Fatal("handoff/FIFO order", sent)
+	}
+	rotWait(t, func() bool { op, _ := e.sessions.Rotation("r"); return op.Status == "SWITCHED" })
+	e.ReceiveMessage(p, &Message{Platform: "test", SessionKey: req.SessionKey, Content: "/switch backend-0", ReplyCtx: "chat"})
+	rotWait(t, func() bool {
+		return strings.Contains(strings.Join(p.getSent(), "\n"), "No session") || strings.Contains(strings.Join(p.getSent(), "\n"), "no match")
+	})
+	if e.sessions.LookupActive(req.SessionKey) == old {
+		t.Fatal("retired session switched back")
+	}
+	outputs := strings.Join(p.getSent(), "\n")
+	if strings.Index(outputs, "A_DONE") > strings.Index(outputs, "Session switched") {
+		t.Fatal("visible order", outputs)
+	}
+}

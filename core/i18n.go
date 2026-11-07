@@ -482,6 +482,9 @@ const (
 	MsgAliasUsage      MsgKey = "alias_usage"
 
 	MsgNewSessionCreated      MsgKey = "new_session_created"
+	MsgRotationSwitched       MsgKey = "rotation_switched"
+	MsgRotationFailed         MsgKey = "rotation_failed"
+	MsgRotationUncertain      MsgKey = "rotation_uncertain"
 	MsgNewSessionCreatedName  MsgKey = "new_session_created_name"
 	MsgSessionAutoResetIdle   MsgKey = "session_auto_reset_idle"
 	MsgSessionClosingGraceful MsgKey = "session_closing_graceful"
@@ -3158,6 +3161,30 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "✅ 新しいセッションを作成しました",
 		LangSpanish:            "✅ Nueva sesión creada",
 	},
+	MsgRotationSwitched: {
+		LangEnglish:            "Session switched to %s; processing the handoff.",
+		LangChinese:            "已切换到新会话 %s，开始处理交接。",
+		LangTraditionalChinese: "已切換到新會話 %s，開始處理交接。",
+		LangJapanese:           "新しいセッション %s に切り替え、引き継ぎを処理します。",
+		LangSpanish:            "Sesión cambiada a %s; procesando el traspaso.",
+	},
+
+	MsgRotationFailed: {
+		LangEnglish:            "Session switch failed: %v",
+		LangChinese:            "会话切换失败：%v",
+		LangTraditionalChinese: "會話切換失敗：%v",
+		LangJapanese:           "セッションの切り替えに失敗：%v",
+		LangSpanish:            "Error al cambiar sesión: %v",
+	},
+
+	MsgRotationUncertain: {
+		LangEnglish:            "Handoff delivery is uncertain; inspect rotation status before retrying.",
+		LangChinese:            "交接投递结果不确定，请核查切换状态后再处理，未自动重复发送。",
+		LangTraditionalChinese: "交接投遞結果不確定，請核查切換狀態後再處理，未自動重複發送。",
+		LangJapanese:           "引き継ぎの配信結果が不明です。再試行前に状態を確認してください。",
+		LangSpanish:            "Entrega del traspaso incierta; compruebe el estado antes de reintentar.",
+	},
+
 	MsgNewSessionCreatedName: {
 		LangEnglish:            "✅ New session created: **%s**",
 		LangChinese:            "✅ 新会话已创建：**%s**",
