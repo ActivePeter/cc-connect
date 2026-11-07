@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -607,5 +609,57 @@ func TestStreamPreview_UnfreezeIdempotent(t *testing.T) {
 	}
 	if !sp.canPreview() {
 		t.Fatal("canPreview() = false after no-op unfreeze, want true")
+	}
+}
+
+func TestStreamPreviewFreezeConfirmsCompleteSegment(t *testing.T) {
+	p := &rotPreviewPlatform{
+		freezeEntered: make(chan struct{}), freezeRelease: make(chan struct{}),
+	}
+	cfg := DefaultStreamPreviewCfg()
+	cfg.IntervalMs = 3600000
+	cfg.MaxChars = 5
+	sp := newStreamPreview(cfg, p, "chat", context.Background(), nil)
+	sp.appendText("first")
+	sp.appendText(" final tail beyond preview limit")
+	done := make(chan error, 1)
+	go func() { done <- sp.freeze() }()
+	select {
+	case <-p.freezeEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("missing final update")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("returned before update acceptance: %v", err)
+	default:
+	}
+	close(p.freezeRelease)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	sp.mu.Lock()
+	if sp.timer != nil || !sp.degraded {
+		t.Error("freeze left updates active")
+	}
+	sp.mu.Unlock()
+	p.previewMu.Lock()
+	defer p.previewMu.Unlock()
+	if len(p.updates) != 1 || p.updates[0] != "first final tail beyond preview limit" {
+		t.Fatal("did not commit complete segment", p.updates)
+	}
+}
+
+func TestStreamPreviewFreezeReturnsDeliveryError(t *testing.T) {
+	refused := fmt.Errorf("update refused")
+	p := &rotPreviewPlatform{freezeErr: refused}
+	sp := newStreamPreview(DefaultStreamPreviewCfg(), p, "chat", context.Background(), nil)
+	sp.appendText("visible prefix")
+	if err := sp.freeze(); !errors.Is(err, refused) {
+		t.Fatalf("lost update error: %v", err)
+	}
+	sp.detachPreview()
+	if !sp.degraded || sp.previewMsgID != nil {
+		t.Fatal("failed freeze left preview active")
 	}
 }

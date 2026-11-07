@@ -2555,3 +2555,56 @@ func TestCUJ_R1_SelfRotationReplyBeforeHandoffAndQueuedInput(t *testing.T) {
 		t.Fatal("visible order", outputs)
 	}
 }
+
+// The deployed full-display configuration must allow a session to request its
+// own rotation after a pre-tool preview was accepted, without losing the tail.
+func TestCUJ_R2_SelfRotationWithVPSPreview(t *testing.T) {
+	a := &rotAgent{}
+	p := &rotPreviewPlatform{rotPlatform: rotPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}}
+	e := NewEngine("rotation", a, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{Mode: "full", ThinkingMessages: true, ToolMessages: false})
+	e.SetStreamPreviewCfg(DefaultStreamPreviewCfg())
+	defer e.Stop()
+	key := "test:chat:user"
+	send := func(text string) {
+		e.ReceiveMessage(p, &Message{Platform: "test", SessionKey: key, Content: text, ReplyCtx: "chat"})
+	}
+	send("Start the task and hand it off when ready.")
+	rotWait(t, func() bool { return a.at(0) != nil && len(a.at(0).sent()) == 1 })
+	old := e.sessions.LookupActive(key)
+	a.at(0).events <- Event{Type: EventText, Content: "SOURCE_PREFACE"}
+	a.at(0).events <- Event{Type: EventText, Content: " pending tail"}
+	a.at(0).events <- Event{Type: EventThinking, Content: "prepare the handoff"}
+	a.at(0).events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "cc-connect session new"}
+	rotWait(t, func() bool {
+		return strings.Contains(strings.Join(p.getSent(), "\n"), "preview-update:SOURCE_PREFACE pending tail")
+	})
+	op, err := e.ScheduleRotation(RotateRequest{SessionKey: key, ExpectedSessionID: old.ID, RequestID: "vps-preview", Handoff: "SECRET_HANDOFF"})
+	if err != nil || op.Status != "SCHEDULED" {
+		t.Fatal(op, err)
+	}
+	send("QUEUED_FOLLOWUP")
+	a.at(0).events <- Event{Type: EventText, Content: "A_DONE"}
+	a.at(0).events <- Event{Type: EventResult, Done: true}
+	rotWait(t, func() bool { op, _ = e.sessions.Rotation("vps-preview"); return op.Status != "SCHEDULED" })
+	if op.Status != "SWITCHED" {
+		t.Fatalf("preview blocked rotation: %s %s", op.Status, op.Error)
+	}
+	rotWait(t, func() bool { return strings.Contains(strings.Join(p.getSent(), "\n"), "HANDOFF_DONE QUEUED_FOLLOWUP") })
+	visible := strings.Join(p.getSent(), "\n")
+	last := -1
+	for _, marker := range []string{"preview-update:SOURCE_PREFACE pending tail", "A_DONE", "Session switched", "HANDOFF_DONE SECRET_HANDOFF", "HANDOFF_DONE QUEUED_FOLLOWUP"} {
+		index := strings.Index(visible, marker)
+		if index <= last {
+			t.Fatalf("missing or reordered %q in %s", marker, visible)
+		}
+		last = index
+	}
+	send("/switch backend-0")
+	rotWait(t, func() bool {
+		return strings.Contains(strings.Join(p.getSent(), "\n"), "No session") || strings.Contains(strings.Join(p.getSent(), "\n"), "no match")
+	})
+	if e.sessions.LookupActive(key) == old {
+		t.Fatal("restored retired source")
+	}
+}

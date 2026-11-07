@@ -21,11 +21,12 @@ import (
 )
 
 type platform struct {
-	mu            sync.Mutex
-	sent          []string
-	notices       chan string
-	engine        *core.Engine
-	sourceAgentID string
+	mu             sync.Mutex
+	sent           []string
+	notices        chan string
+	engine         *core.Engine
+	sourceAgentID  string
+	previewUpdates []string
 }
 
 func (p *platform) Name() string                                   { return "rotation-test" }
@@ -35,7 +36,7 @@ func (p *platform) Reply(c context.Context, r any, s string) error { return p.Se
 func (p *platform) Send(_ context.Context, _ any, s string) error {
 	p.mu.Lock()
 	p.sent = append(p.sent, s)
-	if strings.Contains(s, "SOURCE_DONE") && p.sourceAgentID == "" {
+	if strings.HasPrefix(s, "SOURCE_DONE") && p.sourceAgentID == "" {
 		if active := p.engine.GetSessions().LookupActive("rotation-test:isolated:user"); active != nil {
 			p.sourceAgentID = active.GetAgentSessionID()
 		}
@@ -47,13 +48,45 @@ func (p *platform) Send(_ context.Context, _ any, s string) error {
 	}
 	return nil
 }
+
+// These capabilities exercise the same fallback preview used by the VPS.
+// All accepted sends and edits are recorded in order; native tools stay real.
+func (p *platform) SendPreviewStart(c context.Context, r any, text string) (any, error) {
+	if err := p.Send(c, r, text); err != nil {
+		return nil, err
+	}
+	return "isolated-preview", nil
+}
+func (p *platform) UpdateMessage(c context.Context, r any, text string) error {
+	p.mu.Lock()
+	p.previewUpdates = append(p.previewUpdates, text)
+	p.mu.Unlock()
+	return p.Send(c, r, text)
+}
+func waitIdle(e *core.Engine, key string, requireNew bool) error {
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		s := e.GetSessions().LookupActive(key)
+		if s != nil && (!requireNew || s.ID != "s1") && !s.Busy() {
+			return nil
+		}
+		select {
+		case <-deadline.C:
+			return fmt.Errorf("turn did not reach idle after marker")
+		case <-tick.C:
+		}
+	}
+}
 func (p *platform) wait(marker string) error {
 	deadline := time.NewTimer(180 * time.Second)
 	defer deadline.Stop()
 	for {
 		select {
 		case s := <-p.notices:
-			if strings.Contains(s, "SOURCE_ROTATION_FAILED") {
+			if strings.HasPrefix(s, "SOURCE_ROTATION_FAILED") {
 				return fmt.Errorf("source command or environment guard failed")
 			}
 			if strings.Contains(s, marker) {
@@ -79,6 +112,7 @@ func run() error {
 	sourceHome := flag.String("source-codex-home", "", "reuse existing local login; never sent over the network")
 	effort := flag.String("effort", "", "reasoning effort override for this isolated test")
 	phase := flag.Int("phase", 1, "1 creates and rotates; 2 restarts and verifies")
+	vpsDisplay := flag.Bool("vps-display", false, "full display, thinking on, tools off, default stream preview")
 	credentialConfig := flag.String("credential-config", "", "read-only existing config for claudecode API env")
 	flag.Parse()
 	home, _ := os.UserHomeDir()
@@ -127,7 +161,7 @@ func run() error {
 		// The existing provider selects the actual model; report it in the logs/fixture.
 		model = "configured claudecode provider (see init event)"
 	}
-	if err := writeJSON(filepath.Join(*root, "isolation-config.json"), map[string]any{"agent": *agentName, "backend": *backend, "phase": *phase, "data_dir": filepath.Join(*root, "data"), "work_dir": opts["work_dir"], "platform": "fake only", "credential_config": *credentialConfig, "model": model, "codex_home": *codexHome, "reasoning_effort": *effort, "app_server_transport": "stdio (no TCP listener)"}); err != nil {
+	if err := writeJSON(filepath.Join(*root, "isolation-config.json"), map[string]any{"agent": *agentName, "backend": *backend, "phase": *phase, "data_dir": filepath.Join(*root, "data"), "work_dir": opts["work_dir"], "platform": "fake only", "credential_config": *credentialConfig, "model": model, "codex_home": *codexHome, "reasoning_effort": *effort, "app_server_transport": "stdio (no TCP listener)", "vps_display": *vpsDisplay}); err != nil {
 		return err
 	}
 	ag, err := core.CreateAgent(*agentName, opts)
@@ -138,8 +172,13 @@ func run() error {
 	e := core.NewEngine("rotation-live", ag, []core.Platform{p}, filepath.Join(*root, "data/sessions.json"), core.LangEnglish)
 	p.engine = e
 	e.SetDataDir(filepath.Join(*root, "data"))
-	e.SetStreamPreviewCfg(core.StreamPreviewCfg{Enabled: false})
-	e.SetDisplayConfig(core.DisplayCfg{Mode: "quiet", CardMode: "legacy", ThinkingMessages: false, ToolMessages: false})
+	if *vpsDisplay {
+		e.SetStreamPreviewCfg(core.DefaultStreamPreviewCfg())
+		e.SetDisplayConfig(core.DisplayCfg{Mode: "full", ThinkingMessages: true, ToolMessages: false})
+	} else {
+		e.SetStreamPreviewCfg(core.StreamPreviewCfg{Enabled: false})
+		e.SetDisplayConfig(core.DisplayCfg{Mode: "quiet", CardMode: "legacy", ThinkingMessages: false, ToolMessages: false})
+	}
 	if err = e.Start(); err != nil {
 		return err
 	}
@@ -164,8 +203,15 @@ func run() error {
 		}
 		cli := quote(filepath.Join(filepath.Dir(executable), "cc-connect"))
 		command := "test \"$CC_PROJECT\" = 'rotation-live' && test \"$CC_SESSION_KEY\" = 'rotation-test:isolated:user' && test \"$CC_DATA_DIR\" = " + dataDir + " && test -n \"$CC_SESSION_ID\" && test -n \"$CC_SESSION_SCOPE\" && " + cli + " session new --data-dir " + dataDir + " --prompt 'Reply exactly HANDOFF_SECRET_ROT1, do no other work.' --json"
-		send("This is an isolated session-rotation test. Run exactly one shell command: " + command + ". It must return SCHEDULED. If the tool fails or does not return SCHEDULED, reply exactly SOURCE_ROTATION_FAILED. Otherwise reply exactly SOURCE_DONE. Do not use cc-connect send, /new, background tasks, or other tools.")
+		preface := ""
+		if *vpsDisplay {
+			preface = "First output exactly ROTATION_PREFACE as a visible sentence, then run the shell command. "
+		}
+		send("This is an isolated session-rotation test. " + preface + "Run exactly one shell command: " + command + ". It must return SCHEDULED. If the tool fails or does not return SCHEDULED, reply exactly SOURCE_ROTATION_FAILED. Otherwise reply exactly SOURCE_DONE. Do not use cc-connect send, /new, background tasks, or other tools.")
 		if err = p.wait("HANDOFF_SECRET_ROT1"); err != nil {
+			return err
+		}
+		if err = waitIdle(e, key, true); err != nil {
 			return err
 		}
 		active := e.GetSessions().LookupActive(key)
@@ -175,6 +221,7 @@ func run() error {
 		p.mu.Lock()
 		oldID := p.sourceAgentID
 		sent := append([]string(nil), p.sent...)
+		updates := append([]string(nil), p.previewUpdates...)
 		p.mu.Unlock()
 		newID := active.GetAgentSessionID()
 		if oldID == "" || newID == "" || oldID == newID {
@@ -200,7 +247,7 @@ func run() error {
 		if !e.GetSessions().IsRetiredAgentID(oldID) {
 			return fmt.Errorf("source backend not retired")
 		}
-		return writeJSON(filepath.Join(*root, "phase1.json"), map[string]any{"pass": true, "pid": os.Getpid(), "source_agent_id": oldID, "new_agent_id": newID, "active_session_id": active.ID, "platform_messages": sent})
+		return writeJSON(filepath.Join(*root, "phase1.json"), map[string]any{"pass": true, "pid": os.Getpid(), "source_agent_id": oldID, "new_agent_id": newID, "active_session_id": active.ID, "platform_messages": sent, "preview_updates": updates, "vps_display": *vpsDisplay})
 	}
 	raw, err := os.ReadFile(filepath.Join(*root, "phase1.json"))
 	if err != nil {
@@ -223,6 +270,9 @@ func run() error {
 	}
 	send("Reply with the exact handoff marker you received before the process restarted, followed by RESTART_SECRET_ROT1. Do no other work.")
 	if err = p.wait("RESTART_SECRET_ROT1"); err != nil {
+		return err
+	}
+	if err = waitIdle(e, key, false); err != nil {
 		return err
 	}
 	p.mu.Lock()

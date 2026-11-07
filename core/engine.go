@@ -5158,8 +5158,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				} else {
 					if sp.canPreview() {
-						sp.freeze()
-						unconfirmedPreviewSegment = true
+						if err := sp.freeze(); err != nil {
+							unconfirmedPreviewSegment = true
+							slog.Warn("preview segment delivery unconfirmed", "session", sessionKey, "error", err)
+						}
 						sp.detachPreview()
 					} else {
 						segment := strings.Join(textParts[segmentStart:], "")
@@ -5195,9 +5197,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					segmentStart = len(textParts)
 					silentHold = false
 				}
-				sp.freeze()
+				freezeErr := sp.freeze()
 				if previewActive {
-					unconfirmedPreviewSegment = true
+					if freezeErr != nil {
+						unconfirmedPreviewSegment = true
+						slog.Warn("preview segment delivery unconfirmed", "session", sessionKey, "error", freezeErr)
+					}
 					sp.detachPreview() // keep frozen preview visible as permanent message
 				}
 				preview := truncateIf(event.Content, e.display.ThinkingMaxLen)
@@ -5247,8 +5252,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				} else {
 					if sp.canPreview() {
-						sp.freeze()
-						unconfirmedPreviewSegment = true
+						if err := sp.freeze(); err != nil {
+							unconfirmedPreviewSegment = true
+							slog.Warn("preview segment delivery unconfirmed", "session", sessionKey, "error", err)
+						}
 						sp.detachPreview()
 					} else {
 						segment := strings.Join(textParts[segmentStart:], "")
@@ -5305,9 +5312,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					segmentStart = len(textParts)
 					silentHold = false
 				}
-				sp.freeze()
+				freezeErr := sp.freeze()
 				if previewActive {
-					unconfirmedPreviewSegment = true
+					if freezeErr != nil {
+						unconfirmedPreviewSegment = true
+						slog.Warn("preview segment delivery unconfirmed", "session", sessionKey, "error", freezeErr)
+					}
 					sp.detachPreview() // keep frozen preview visible as permanent message
 				}
 				toolInput := event.ToolInput
@@ -5558,9 +5568,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				segmentStart = len(textParts)
 				silentHold = false
 			}
-			sp.freeze()
+			freezeErr := sp.freeze()
 			if previewActive {
-				unconfirmedPreviewSegment = true
+				if freezeErr != nil {
+					unconfirmedPreviewSegment = true
+					slog.Warn("preview segment delivery unconfirmed", "session", sessionKey, "error", freezeErr)
+				}
 				sp.detachPreview() // keep frozen preview visible as permanent message
 			}
 

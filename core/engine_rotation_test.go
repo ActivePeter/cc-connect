@@ -446,3 +446,100 @@ func TestRotationScopeAndLifecycleRejectStaleRequests(t *testing.T) {
 		t.Fatal("invalid request was registered", err)
 	}
 }
+
+// rotPreviewPlatform matches the VPS fallback-preview capabilities: edits and
+// preview starts are supported, but full display does not use rich cards.
+type rotPreviewPlatform struct {
+	rotPlatform
+	previewMu     sync.Mutex
+	updates       []string
+	freezeEntered chan struct{}
+	freezeRelease chan struct{}
+	freezeOnce    sync.Once
+	freezeErr     error
+}
+
+func (p *rotPreviewPlatform) SendPreviewStart(ctx context.Context, rc any, text string) (any, error) {
+	if err := p.stubPlatformEngine.Send(ctx, rc, "preview-start:"+text); err != nil {
+		return nil, err
+	}
+	return "preview", nil
+}
+func (p *rotPreviewPlatform) UpdateMessage(ctx context.Context, handle any, text string) error {
+	p.freezeOnce.Do(func() {
+		if p.freezeEntered != nil {
+			close(p.freezeEntered)
+			<-p.freezeRelease
+		}
+	})
+	if p.freezeErr != nil {
+		return p.freezeErr
+	}
+	p.previewMu.Lock()
+	p.updates = append(p.updates, text)
+	p.previewMu.Unlock()
+	return p.stubPlatformEngine.Send(ctx, handle, "preview-update:"+text)
+}
+
+func TestRotationPreviewFreezeReceipt(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			a := &rotAgent{}
+			p := &rotPreviewPlatform{
+				rotPlatform:   rotPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}},
+				freezeEntered: make(chan struct{}), freezeRelease: make(chan struct{}),
+			}
+			if fail {
+				p.freezeErr = fmt.Errorf("preview update refused")
+			}
+			e := NewEngine("rotation", a, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+			e.SetDisplayConfig(DisplayCfg{Mode: "full", ThinkingMessages: true, ToolMessages: false})
+			e.SetStreamPreviewCfg(DefaultStreamPreviewCfg())
+			defer e.Stop()
+			key := "test:chat:user"
+			e.ReceiveMessage(p, &Message{Platform: "test", SessionKey: key, Content: "ORIGINAL", ReplyCtx: "chat"})
+			rotWait(t, func() bool { return a.at(0) != nil && len(a.at(0).sent()) == 1 })
+			old := e.sessions.LookupActive(key)
+			op, err := e.ScheduleRotation(RotateRequest{SessionKey: key, ExpectedSessionID: old.ID, RequestID: "preview", Handoff: "SECRET_HANDOFF"})
+			if err != nil || op.Status != "SCHEDULED" {
+				t.Fatal(op, err)
+			}
+			a.at(0).events <- Event{Type: EventText, Content: "SOURCE_PREFACE"}
+			a.at(0).events <- Event{Type: EventText, Content: " pending tail"}
+			a.at(0).events <- Event{Type: EventThinking, Content: "plan the next step"}
+			select {
+			case <-p.freezeEntered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("freeze did not synchronously update")
+			}
+			a.at(0).events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "cc-connect session new"}
+			a.at(0).events <- Event{Type: EventText, Content: "A_DONE"}
+			a.at(0).events <- Event{Type: EventResult, Done: true}
+			if a.count() != 1 || e.sessions.LookupActive(key) != old {
+				t.Fatal("switched without preview update acceptance")
+			}
+			close(p.freezeRelease)
+			rotWait(t, func() bool { op, _ = e.sessions.Rotation("preview"); return op.Status != "SCHEDULED" })
+			want := "SWITCHED"
+			if fail {
+				want = "FAILED"
+			}
+			if op.Status != want {
+				t.Fatalf("rotation=%s want %s: %s", op.Status, want, op.Error)
+			}
+			if fail {
+				if e.sessions.LookupActive(key) != old || a.count() != 1 {
+					t.Fatal("failed freeze retired old session")
+				}
+			} else {
+				p.previewMu.Lock()
+				updated := append([]string(nil), p.updates...)
+				p.previewMu.Unlock()
+				if len(updated) == 0 || updated[0] != "SOURCE_PREFACE pending tail" {
+					t.Fatal("missing final preview tail", updated)
+				}
+				rotWait(t, func() bool { return strings.Contains(strings.Join(p.getSent(), "\n"), "HANDOFF_DONE") })
+			}
+		})
+	}
+}

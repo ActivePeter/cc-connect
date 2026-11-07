@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -291,33 +292,45 @@ func (sp *streamPreview) flushLocked(text string) {
 	sp.lastSentAt = time.Now()
 }
 
-// freeze stops the streaming preview permanently: cancels pending timers,
-// updates the preview message in-place with the accumulated text, and marks
-// the preview as degraded so no further updates are sent.
-// Call this when a permission prompt or other interruption occurs.
-func (sp *streamPreview) freeze() {
+// freeze synchronously commits the complete accumulated segment before its
+// handle can be detached. Pending timer updates serialize on mu; after this
+// returns no timer can write to the frozen preview. A successful return is a
+// platform acceptance receipt, not a guarantee that a recipient has read it.
+func (sp *streamPreview) freeze() error {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 
 	sp.cancelTimerLocked()
+	defer func() { sp.degraded = true }()
 
-	if sp.previewMsgID != nil && !sp.degraded {
-		if updater, ok := sp.platform.(MessageUpdater); ok {
-			text := sp.fullText
-			maxChars := sp.cfg.MaxChars
-			if maxChars > 0 && len([]rune(text)) > maxChars {
-				text = string([]rune(text)[:maxChars]) + "…"
-			}
-			if text != "" {
-				if sp.transform != nil {
-					text = sp.transform(text)
-				}
-				_ = updater.UpdateMessage(sp.ctx, sp.previewMsgID, text)
-			}
-		}
+	text := sp.fullText
+	if sp.transform != nil {
+		text = sp.transform(text)
 	}
-
-	sp.degraded = true
+	if text == "" {
+		return nil
+	}
+	// As with finish, commit the full segment rather than the MaxChars-limited
+	// live preview: the caller will not resend this text after detaching.
+	if sp.previewMsgID == nil {
+		return fmt.Errorf("stream preview freeze: no message handle")
+	}
+	updater, ok := sp.platform.(MessageUpdater)
+	if !ok {
+		return fmt.Errorf("stream preview freeze: no MessageUpdater")
+	}
+	if text == sp.lastSentText && sp.lastSentViaUpdate {
+		return nil // the complete segment already has an accepted update
+	}
+	// Retry even if an earlier live update degraded the preview. Only this
+	// final update decides whether the complete frozen segment was accepted.
+	if err := updater.UpdateMessage(sp.ctx, sp.previewMsgID, text); err != nil {
+		return fmt.Errorf("stream preview freeze: final update: %w", err)
+	}
+	sp.lastSentText = text
+	sp.lastSentViaUpdate = true
+	sp.lastSentAt = time.Now()
+	return nil
 }
 
 // unfreeze reverses a prior freeze()+detachPreview() so the preview resumes
