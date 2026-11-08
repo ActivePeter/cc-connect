@@ -361,6 +361,9 @@ type LocationAttachment struct {
 
 // Message represents a unified incoming message from any platform.
 type Message struct {
+	topicAdmitted bool
+	topicRun      *topicRun
+
 	rotationState *interactiveState // internal outbox delivery; never resurrect after a lifecycle command
 	SessionKey    string            // unique key for user context, e.g. "feishu:{chatID}:{userID}"
 	Platform      string

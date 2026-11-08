@@ -1027,6 +1027,8 @@ app_secret = "your-feishu-app-secret"
 # share_session_in_channel = false  # If true, all users in a group share one agent session
 #                                   # 设为 true 时，群聊内所有用户共享同一个 Agent 会话
 # thread_isolation = false  # If true, group messages use Feishu reply threads as session boundaries (one thread/root = one agent session and, in multi-workspace mode, one workspace binding)
+# thread_isolation_mode = "topic_only" # Executor only: actual thread_id gets an independent session; top-level/ordinary replies retain their existing key. Do not combine with thread_isolation=true.
+# topic_concurrency = 4  # Max simultaneously active topic sessions per group (1..64); overflow waits FIFO. Main session excluded.
 #                           # 设为 true 时，群聊按飞书话题/根消息隔离会话；multi-workspace 模式下每个话题也独立绑定 workspace
 # mention_requester_on_completion = false  # Send one native @ of the human requester after each final group reply; progress and private chats are unaffected
 #                           # 群聊最终回复后 @ 本轮发起人一次；中间进度和私聊不受影响

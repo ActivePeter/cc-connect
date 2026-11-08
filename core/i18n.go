@@ -159,6 +159,10 @@ func (i *I18n) SetLang(lang Language) {
 type MsgKey string
 
 const (
+	MsgTopicQueued    MsgKey = "topic_queued"
+	MsgTopicStopping  MsgKey = "topic_stopping"
+	MsgTopicCancelled MsgKey = "topic_cancelled"
+
 	MsgStarting                  MsgKey = "starting"
 	MsgThinking                  MsgKey = "thinking"
 	MsgTool                      MsgKey = "tool"
@@ -654,6 +658,9 @@ const (
 )
 
 var messages = map[MsgKey]map[Language]string{
+	MsgTopicQueued:    {LangEnglish: "Queued; %d topics ahead.", LangChinese: "排队中，前面还有 %d 个。", LangTraditionalChinese: "排隊中，前面還有 %d 個。", LangJapanese: "待機中です。前に %d 件のトピックがあります。", LangSpanish: "En cola; hay %d temas por delante."},
+	MsgTopicStopping:  {LangEnglish: "Topics are stopping. Please send after stopping completes.", LangChinese: "话题正在停止，请在停止完成后再发送。", LangTraditionalChinese: "話題正在停止，請在停止完成後再傳送。", LangJapanese: "トピックを停止中です。停止完了後に送信してください。", LangSpanish: "Se están deteniendo los temas. Envía el mensaje al finalizar."},
+	MsgTopicCancelled: {LangEnglish: "Queued topic message cancelled.", LangChinese: "已取消排队的话题消息。", LangTraditionalChinese: "已取消排隊的話題訊息。", LangJapanese: "待機中のトピックメッセージを取り消しました。", LangSpanish: "Mensaje de tema en cola cancelado."},
 	MsgStarting: {
 		LangEnglish:            "⏳ Processing...",
 		LangChinese:            "⏳ 处理中...",

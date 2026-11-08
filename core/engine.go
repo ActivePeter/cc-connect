@@ -346,6 +346,13 @@ type RateLimitCfg struct {
 
 // Engine routes messages between platforms and the agent for a single project.
 type Engine struct {
+	topicMu            sync.Mutex
+	topicGroups        map[string]*topicGroup
+	topicRecordsMu     sync.Mutex
+	topicCreateMu      sync.Mutex
+	topicRecordsLoaded bool
+	topicRecords       map[string]TopicRecord
+
 	rotationLifecycle     map[string]int
 	rotationGeneration    map[string]uint64
 	rotationMu            sync.Mutex
@@ -2353,6 +2360,7 @@ func (e *Engine) Stop() error {
 
 	// Cancel first so late lifecycle callbacks observe shutdown immediately.
 	e.cancel()
+	e.closeTopics()
 
 	if e.observeCancel != nil {
 		e.observeCancel()
@@ -2804,6 +2812,13 @@ func (e *Engine) startMessageRecallMonitor(sessionKey string) context.CancelFunc
 }
 
 func (e *Engine) handleMessage(p Platform, msg *Message) {
+	if e.routeTopicMessage(p, msg) {
+		return
+	}
+	if !msg.topicAdmitted {
+		e.prefixTopicOrigin(p, msg)
+	}
+
 	if msg.Recalled {
 		e.handleMessageRecall(p, msg)
 		return
@@ -3256,6 +3271,7 @@ func (e *Engine) ensureInteractiveStateForQueueing(key string, p Platform, reply
 // to the drain loop in processInteractiveMessageWith but as a standalone
 // goroutine.
 func (e *Engine) drainOrphanedQueue(session *Session, sessions *SessionManager, interactiveKey string, agent Agent, workspaceDir string) {
+	defer e.topicIdle(sessions.KeyForSession(session.ID))
 	unlocked := false
 	defer func() {
 		if !unlocked {
@@ -3718,6 +3734,8 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 // and workspaceDir so that multi-workspace mode can route to per-workspace agents.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY in the agent env; otherwise interactiveKey is used.
 func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string) {
+	defer e.topicIdle(msg.SessionKey)
+
 	// session.Unlock() is NOT deferred here — it is called explicitly in
 	// the drain loop below while holding state.mu to close the race window
 	// between "queue is empty" and "session unlocked". A deferred fallback
@@ -3770,7 +3788,23 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if agent != e.agent {
 		agentOverride = agent
 	}
-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, msg.rotationState)
+	run := msg.topicRun
+	if run != nil {
+		run.startMu.Lock()
+	}
+	var state *interactiveState
+	if run == nil || !run.cancelled.Load() {
+		state = e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, msg.rotationState)
+	}
+	if run != nil {
+		if run.cancelled.Load() {
+			state = nil
+		}
+		run.startMu.Unlock()
+	}
+	if state == nil {
+		return
+	}
 
 	// Set workspaceDir on the state for idle reaper identification
 	if workspaceDir != "" {
@@ -4461,15 +4495,12 @@ func (e *Engine) cleanupInteractiveStateForIdleToken(sessionKey string, expected
 	e.interactiveMu.Unlock()
 }
 
-func (e *Engine) closeAgentSessionAsync(sessionKey string, agentSession AgentSession) {
-	if agentSession == nil {
-		return
-	}
-	go e.closeAgentSessionWithTimeout(sessionKey, agentSession)
-}
-
 func (e *Engine) closeAgentSessionWithTimeout(sessionKey string, agentSession AgentSession) {
+	e.closeAgentSessionWithReceipt(sessionKey, agentSession, e.trackTopicClose(sessionKey))
+}
+func (e *Engine) closeAgentSessionWithReceipt(sessionKey string, agentSession AgentSession, finish func()) {
 	if agentSession == nil {
+		finish()
 		return
 	}
 
@@ -4487,6 +4518,7 @@ func (e *Engine) closeAgentSessionWithTimeout(sessionKey string, agentSession Ag
 	done := make(chan struct{})
 	go func() {
 		agentSession.Close()
+		finish()
 		close(done)
 	}()
 
@@ -10265,6 +10297,9 @@ func (e *Engine) cmdTTS(p Platform, msg *Message, args []string) {
 }
 
 func (e *Engine) cmdStop(p Platform, msg *Message) {
+	e.cancelTopic(msg.SessionKey)
+	defer e.topicIdle(msg.SessionKey)
+
 	// /stop only tears down the live agent process; it preserves the stored
 	// AgentSessionID so the next message can --resume the conversation. This
 	// matches the card-button stop path (see executeCardAction "/stop"). The
@@ -10398,6 +10433,7 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 
 normalCleanup:
 	state.markStopped()
+	finishTopicClose := e.trackTopicClose(sessionKey)
 	delete(e.interactiveStates, sessionKey)
 	e.interactiveMu.Unlock()
 
@@ -10411,7 +10447,7 @@ normalCleanup:
 		state.pendingMessages = nil
 		state.mu.Unlock()
 	}
-	e.closeAgentSessionAsync(sessionKey, agentSession)
+	go e.closeAgentSessionWithReceipt(sessionKey, agentSession, finishTopicClose)
 
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventSessionEnded,

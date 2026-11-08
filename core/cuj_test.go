@@ -2608,3 +2608,51 @@ func TestCUJ_R2_SelfRotationWithVPSPreview(t *testing.T) {
 		t.Fatal("restored retired source")
 	}
 }
+
+func TestCUJ_TF1_ParallelExecutorTopics(t *testing.T) {
+	e, p, a := tfEnv(t, 4)
+	tfSend(e, p, "", "MAIN")
+	main := tfNext(t, a, "MAIN")
+	var starts []tfStart
+	for i := 1; i <= 3; i++ {
+		label := fmt.Sprintf("TOPIC-%d", i)
+		tfSend(e, p, fmt.Sprint(i), label)
+		starts = append(starts, tfNext(t, a, label))
+	}
+	// All four independent sessions have accepted Send before any result.
+	if a.count.Load() != 4 {
+		t.Fatalf("processes=%d", a.count.Load())
+	}
+	t.Logf("concurrent starts main=%s topic1=%s topic2=%s topic3=%s; no completion yet", main.at.Format(time.RFC3339Nano), starts[0].at.Format(time.RFC3339Nano), starts[1].at.Format(time.RFC3339Nano), starts[2].at.Format(time.RFC3339Nano))
+	starts[0].s.finish("DELIVERED-TOPIC-1")
+	tfWait(t, func() bool { return tfSaw(p, "DELIVERED-TOPIC-1") })
+	// Commander-created topic metadata enables origin prefix on its main key.
+	e.sessions.GetOrCreateActive("test:chat:commander")
+	record := TopicRecord{RequestID: strings.Repeat("b", 32), SessionKey: "test:chat:commander", Platform: "test", ChatID: "chat", Title: "Title", TopicReceipt: TopicReceipt{RootID: "root", ThreadID: "1", Status: "sent"}}
+	if err := e.putTopic(record); err != nil {
+		t.Fatal(err)
+	}
+	delivery := &Message{SessionKey: "test:chat:commander", Content: "DELIVERY", ReplyCtx: tfContext{"chat", "1", "root"}}
+	e.ReceiveMessage(&tfCommander{p}, delivery)
+	// Main is busy, so the delivery is queued in the same commander's session.
+	main.s.finish("MAIN-DONE")
+	merged := tfNext(t, a, "[话题 Fetched title thread=1]")
+	if merged.s != main.s {
+		t.Fatal("delivery created a second commander")
+	}
+	merged.s.finish("REVIEWED-DELIVERY")
+	tfWait(t, func() bool { return tfSaw(p, "REVIEWED-DELIVERY") })
+	tfSend(e, p, "2", "/stop")
+	tfWait(t, func() bool { return !starts[1].s.Alive() })
+	if !starts[2].s.Alive() {
+		t.Fatal("single stop reached topic 3")
+	}
+	if out := e.StopTopics("test", "chat"); out.Stopped < 1 {
+		t.Fatal("all stop missed remaining executor")
+	}
+	tfWait(t, func() bool { return !starts[2].s.Alive() })
+	t.Logf("single-stop and stop-all completed at %s; main preserved=%v", time.Now().Format(time.RFC3339Nano), main.s.Alive())
+	if !main.s.Alive() {
+		t.Fatal("stop-all killed commander main")
+	}
+}

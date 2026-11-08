@@ -222,6 +222,7 @@ var topLevelCommandHandlers = map[string]func([]string){
 	"relay":     runRelay,
 	"sessions":  runSessions,
 	"session":   runSession,
+	"topic":     runTopic,
 	"agent-sid": runAgentSID,
 	"daemon":    runDaemon,
 	"feishu":    runFeishu,
@@ -1651,6 +1652,7 @@ Commands:
     exec             Trigger a scheduled task immediately
     del              Delete a scheduled task by ID
 
+  topic new/list     Create executor topics or list topics opened by this session
   sessions           Browse session history
     list             List all sessions (pipe-friendly)
     show <id>        Show session messages (-n N for last N)
