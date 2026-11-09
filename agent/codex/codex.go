@@ -577,6 +577,16 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 
 // ── SkillProvider implementation ──────────────────────────────
 
+// SupportsGoalMode reports whether sessions of this agent carry a native goal
+// (codex app-server thread/goal/*). Only the app_server backend does; the exec
+// backend has no goal API.
+func (a *Agent) SupportsGoalMode() bool {
+	a.mu.RLock()
+	backend := a.backend
+	a.mu.RUnlock()
+	return backend == "app_server"
+}
+
 func (a *Agent) SkillDirs() []string {
 	a.mu.RLock()
 	workDir := a.workDir

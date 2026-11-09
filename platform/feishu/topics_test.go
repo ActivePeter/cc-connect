@@ -177,6 +177,10 @@ func TestTopicOnlyBotEventRoutesWithActualThreadID(t *testing.T) {
 		if rc.threadID != "omt_actual" || !p.shouldReplyInThread(rc) {
 			t.Fatalf("%+v", rc)
 		}
+		main, err := p.ReconstructReplyCtx("feishu:oc_chat:ou_commander")
+		if err != nil || p.TopicInfo(main).ChatID != "oc_chat" {
+			t.Fatalf("inbound event did not retain group type: %v", err)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("bot mention not delivered")
 	}
@@ -342,6 +346,10 @@ func TestTopicOnlyColdReplyContextUsesMessageAnchor(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(r.URL.Path, "tenant_access_token") {
 			writeJSON(t, w, map[string]any{"code": 0, "expire": 7200, "tenant_access_token": "cold-topic-token"})
+			return
+		}
+		if r.URL.Path == "/open-apis/im/v1/chats/oc_chat" {
+			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"chat_mode": "group"}})
 			return
 		}
 		if r.URL.Query().Get("container_id_type") != "thread" || r.URL.Query().Get("container_id") != "omt_topic" {

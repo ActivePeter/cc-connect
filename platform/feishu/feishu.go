@@ -156,6 +156,7 @@ type Platform struct {
 	mentionMap       map[string]string // agent name -> open_id (for outbound @ resolution)
 	userNameCache    sync.Map          // open_id -> display name
 	chatNameCache    sync.Map          // chat_id -> chat name
+	groupChatCache   sync.Map          // chat_id -> bool; confirmed by event chat_type or SDK chat_mode
 	chatMemberCache  sync.Map          // chatID -> *chatMemberEntry
 	recalledMu       sync.Mutex
 	recalledMsgIDs   map[string]time.Time // message_id -> recall time, short TTL race guard
@@ -1395,6 +1396,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	if msg.ChatType != nil {
 		chatType = *msg.ChatType
 	}
+	p.cacheEventChatType(chatID, chatType)
 	mentionCount := len(msg.Mentions)
 	slog.Debug(p.tag()+": inbound message",
 		"message_id", messageID,
@@ -3910,6 +3912,11 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 		return nil, fmt.Errorf("%s: invalid session key %q", p.tag(), sessionKey)
 	}
 	rc := replyContext{chatID: parts[1], sessionKey: sessionKey}
+	// A cold session key does not carry chat type. Metadata lookups belong to
+	// topic creation, never the ordinary send/timer/cron reconstruction path.
+	if group, known := p.groupChatCache.Load(parts[1]); known {
+		rc.groupChat = group.(bool)
+	}
 	if p.topicOnly && len(parts) == 3 && strings.HasPrefix(parts[2], "thread:") {
 		thread := strings.TrimPrefix(parts[2], "thread:")
 		items, err := p.topicMessages(context.Background(), thread)

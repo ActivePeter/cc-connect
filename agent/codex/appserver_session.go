@@ -81,6 +81,31 @@ type itemNotification struct {
 	Item     map[string]any `json:"item"`
 }
 
+// threadGoal mirrors the fields of codex's ThreadGoal that we surface.
+type threadGoal struct {
+	ThreadID   string `json:"threadId"`
+	Objective  string `json:"objective"`
+	Status     string `json:"status"`
+	TokensUsed int64  `json:"tokensUsed"`
+}
+
+type threadGoalSetResponse struct {
+	Goal threadGoal `json:"goal"`
+}
+
+type threadGoalGetResponse struct {
+	Goal *threadGoal `json:"goal"`
+}
+
+type threadGoalClearResponse struct {
+	Cleared bool `json:"cleared"`
+}
+
+type threadGoalNotification struct {
+	ThreadID string     `json:"threadId"`
+	Goal     threadGoal `json:"goal"`
+}
+
 type errorNotification struct {
 	Message string `json:"message"`
 }
@@ -176,10 +201,38 @@ type appServerSession struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	stateMu      sync.Mutex
-	pendingMsgs  []string
-	currentTurn  string
-	preambleSent bool
+	workStateMu       sync.RWMutex
+	workStateCallback func()
+
+	queueDeliveryMu               sync.Mutex // serializes queue RPCs with clear/close
+	queueMu                       sync.Mutex
+	messageQueue                  []*deferredMessage
+	queueWake                     chan struct{}
+	queueEpoch                    uint64
+	queueInFlight                 int
+	queueAttempts, queueMisses    int
+	queueWatchdog                 *time.Timer // guarded by queueMu
+	queueWatchdogTriggers         int
+	turnSequence, turnCompletions uint64 // guarded by stateMu
+	turnUnsteerable               bool
+	lastTurnCompletedAt           time.Time // guarded by stateMu
+
+	stateMu                sync.Mutex
+	pendingMsgs            []string
+	currentTurn            string
+	lastNativeTurnActivity time.Time // guarded by stateMu; also refreshed by a new goal
+	preambleSent           bool
+
+	goalClearPending  int
+	goalClearInFlight bool
+	goalClearEarly    bool
+	goalSetAfterClear bool
+	goalMu            sync.Mutex // mirrors thread/goal/* for /goal status and message gating
+	goalObjective     string
+	goalStatus        string
+	goalTokensUsed    int64
+	resumeGoal        string
+	goalNotice        string // notice held until the current turn's result is out
 
 	runtimeMu sync.RWMutex
 	usage     *core.UsageReport
@@ -337,6 +390,12 @@ func (s *appServerSession) ensureThread(resumeID string) error {
 		s.applyThreadRuntimeState(resp.Cwd, resp.Model, resp.ReasoningEffort)
 		s.threadID.Store(resp.Thread.ID)
 		slog.Info("codex app-server thread resumed", "thread_id", resp.Thread.ID)
+		if err := s.syncGoalAfterResume(); err != nil {
+			if core.IsGoalQuery(s.ctx) {
+				return err
+			}
+			slog.Warn("codex app-server goal sync after resume failed", "error", err)
+		}
 		return nil
 	}
 
@@ -442,9 +501,22 @@ func (s *appServerSession) storeContextUsage(usage *core.ContextUsage) {
 }
 
 func (s *appServerSession) Send(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
+	err := s.send(prompt, messageID, images, files)
+	if err == nil {
+		s.notifyWorkStateChanged()
+	}
+	return err
+}
+
+// send is also used by the deferred worker while it owns queueDeliveryMu. Its
+// caller publishes the state change only after releasing that lock.
+func (s *appServerSession) send(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
 	if !s.alive.Load() {
 		return fmt.Errorf("session is closed")
 	}
+	// The engine drains stale events before Send, so a notice queued at resume
+	// time is released here instead of being drained away.
+	s.flushGoalNotice(true)
 
 	if len(files) > 0 {
 		filePaths := core.SaveFilesToDisk(s.workDir, messageID, files)
@@ -505,11 +577,48 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 
 	s.stateMu.Lock()
 	s.currentTurn = resp.Turn.ID
+	s.lastNativeTurnActivity = time.Now()
 	s.pendingMsgs = s.pendingMsgs[:0]
 	s.stateMu.Unlock()
 
 	return nil
 }
+
+// SendMidTurn appends text to the active turn without starting a new turn or
+// mutating its goal. expectedTurnId makes a concurrent turn transition fail
+// explicitly rather than delivering the message to an unintended turn.
+func (s *appServerSession) SendMidTurn(prompt, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
+	if !s.alive.Load() {
+		return fmt.Errorf("codex app-server: session is closed")
+	}
+	if len(images) > 0 || len(files) > 0 {
+		return fmt.Errorf("codex app-server turn/steer: attachments require a separate turn")
+	}
+	threadID := s.CurrentSessionID()
+	if threadID == "" {
+		return fmt.Errorf("codex app-server turn/steer: thread id is empty")
+	}
+	s.stateMu.Lock()
+	turnID := s.currentTurn
+	s.stateMu.Unlock()
+	if turnID == "" {
+		return fmt.Errorf("codex app-server turn/steer: no active turn to steer")
+	}
+	// Do not hold stateMu over RPC: the notification reader must be able to
+	// advance currentTurn while the response is in flight. Review/compact
+	// turns and stale ids are rejected by app-server and surfaced unchanged.
+	params := map[string]any{
+		"threadId":       threadID,
+		"expectedTurnId": turnID,
+		"input":          []map[string]any{{"type": "text", "text": prompt, "text_elements": []any{}}},
+	}
+	if err := s.request("turn/steer", params, nil); err != nil {
+		return fmt.Errorf("codex app-server turn/steer: %w", err)
+	}
+	return nil
+}
+
+var _ core.MidTurnMessageSender = (*appServerSession)(nil)
 
 func (s *appServerSession) stageImages(prompt string, images []core.ImageAttachment) (string, []string, error) {
 	if len(images) == 0 {
@@ -937,9 +1046,35 @@ func (s *appServerSession) Alive() bool {
 	return s.alive.Load()
 }
 
+// SetWorkStateCallback installs an optional state-change observer. It does not
+// start a goroutine or issue an RPC. The observer may read GoalTurnRunning,
+// GetGoal and PendingMidTurnMessages, and should return promptly. Callers must
+// take their initial snapshot after registration; notifications are hints to
+// reread current state, not a history of every intermediate state.
+func (s *appServerSession) SetWorkStateCallback(callback func()) {
+	s.workStateMu.Lock()
+	s.workStateCallback = callback
+	s.workStateMu.Unlock()
+}
+
+// notifyWorkStateChanged must be called after releasing backend state and
+// deferred-delivery locks. The callback lock is also released before calling
+// out so that observers can replace or remove themselves safely.
+func (s *appServerSession) notifyWorkStateChanged() {
+	s.workStateMu.RLock()
+	callback := s.workStateCallback
+	s.workStateMu.RUnlock()
+	if callback != nil {
+		callback()
+	}
+}
+
 func (s *appServerSession) Close() error {
+	s.queueMu.Lock()
 	s.alive.Store(false)
 	s.cancel()
+	s.queueMu.Unlock()
+	s.clearDeferredMessages("session close/restart")
 
 	s.procMu.Lock()
 	if s.stdin != nil {
@@ -965,11 +1100,15 @@ func (s *appServerSession) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.events)
 	})
+	s.notifyWorkStateChanged()
 	return nil
 }
 
 func (s *appServerSession) readLoop(r io.Reader) {
-	defer s.wg.Done()
+	defer func() {
+		s.wg.Done()
+		s.notifyWorkStateChanged()
+	}()
 	scanner := bufio.NewScanner(r)
 	scanBuf := make([]byte, 0, 64*1024)
 	const maxLineSize = 10 * 1024 * 1024 // 10MB
@@ -1057,7 +1196,10 @@ func (s *appServerSession) stderrLoop(r io.Reader) {
 }
 
 func (s *appServerSession) waitLoop() {
-	defer s.wg.Done()
+	defer func() {
+		s.wg.Done()
+		s.notifyWorkStateChanged()
+	}()
 
 	s.procMu.Lock()
 	cmd := s.cmd
@@ -1106,14 +1248,26 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
 			s.stateMu.Lock()
 			s.currentTurn = notif.Turn.ID
+			s.lastNativeTurnActivity = time.Now()
+			s.turnSequence++
+			s.turnUnsteerable = false
 			s.pendingMsgs = s.pendingMsgs[:0]
 			s.stateMu.Unlock()
 			s.storeContextUsage(nil)
+			s.stopDeferredWatchdog()
+			s.signalDeferredMessages()
+			s.notifyWorkStateChanged()
 		}
 
 	case "item/started":
 		var notif itemNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+			kind, _ := notif.Item["type"].(string)
+			if kind == "enteredReviewMode" || kind == "contextCompaction" {
+				s.stateMu.Lock()
+				s.turnUnsteerable = true
+				s.stateMu.Unlock()
+			}
 			s.handleItemStarted(notif.Item)
 		}
 
@@ -1140,6 +1294,36 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 			// In codex 0.125+, thread going idle signals turn completion.
 			s.completeTurn()
 		}
+
+	case "thread/goal/updated":
+		var notif threadGoalNotification
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+			s.handleGoalUpdated(notif.Goal)
+		}
+
+	case "thread/goal/cleared":
+		var notif struct {
+			ThreadID string `json:"threadId"`
+		}
+		if json.Unmarshal(paramsRaw, &notif) != nil || notif.ThreadID != s.CurrentSessionID() {
+			return
+		}
+		s.goalMu.Lock()
+		discard := false
+		if s.goalClearPending > 0 {
+			s.goalClearPending--
+			discard = s.goalSetAfterClear
+		} else if s.goalClearInFlight {
+			// The reader can process the notification before ClearGoal
+			// receives the response, despite the wire ordering.
+			s.goalClearEarly = true
+		}
+		if !discard {
+			s.goalObjective, s.goalStatus, s.goalTokensUsed = "", "", 0
+		}
+		s.goalMu.Unlock()
+		s.signalDeferredMessages()
+		s.notifyWorkStateChanged()
 
 	case "account/rateLimits/updated":
 		var notif appServerRateLimitsResponse
@@ -1515,9 +1699,223 @@ func (s *appServerSession) completeTurn() {
 		return
 	}
 	s.currentTurn = ""
+	s.turnCompletions++
+	s.lastTurnCompletedAt = time.Now()
+	s.lastNativeTurnActivity = s.lastTurnCompletedAt
 	s.stateMu.Unlock()
 	s.flushPendingAsText()
 	s.emit(core.Event{Type: core.EventResult, SessionID: s.CurrentSessionID(), Done: true})
+	// A goal status change that arrived mid-turn must be announced only after
+	// this turn's text has been delivered: codex marks the goal complete a few
+	// seconds before the (check) turn itself completes.
+	s.flushGoalNotice(false)
+	s.signalDeferredMessages()
+	s.notifyWorkStateChanged()
+}
+
+// NativeTurnProgress retains completed-but-not-yet-delivered turns, including
+// a new turn which starts before the previous completion callback is observed.
+func (s *appServerSession) NativeTurnProgress() (uint64, bool) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.turnCompletions, s.currentTurn != ""
+}
+
+// LastNativeTurnActivity is the most recent native start/completion or new
+// goal-set time. Topic admission uses it for its goal-only idle deadline.
+func (s *appServerSession) LastNativeTurnActivity() time.Time {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.lastNativeTurnActivity
+}
+
+// ── GoalController ────────────────────────────────────────────
+
+func (s *appServerSession) GoalTurnRunning() bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.currentTurn != ""
+}
+func (s *appServerSession) GoalResumeNotice() string {
+	s.goalMu.Lock()
+	defer s.goalMu.Unlock()
+	return s.resumeGoal
+}
+func (s *appServerSession) AckGoalResumeNotice(objective string) {
+	s.goalMu.Lock()
+	defer s.goalMu.Unlock()
+	if objective != "" && s.resumeGoal == objective {
+		s.resumeGoal = ""
+	}
+}
+
+func (s *appServerSession) SetGoal(objective string) (core.GoalInfo, error) {
+	info, err := s.setGoal(objective)
+	if err == nil {
+		s.notifyWorkStateChanged()
+	}
+	return info, err
+}
+
+// setGoal leaves notification to its caller, including the deferred worker
+// which must release queueDeliveryMu before notifying observers.
+func (s *appServerSession) setGoal(objective string) (core.GoalInfo, error) {
+	threadID := s.CurrentSessionID()
+	if threadID == "" {
+		return core.GoalInfo{}, fmt.Errorf("codex app-server thread id is empty")
+	}
+	var resp threadGoalSetResponse
+	params := map[string]any{"threadId": threadID, "objective": objective, "status": "active", "origin": "user"}
+	if err := s.request("thread/goal/set", params, &resp); err != nil {
+		return core.GoalInfo{}, err
+	}
+	s.goalMu.Lock()
+	s.goalSetAfterClear = true
+	s.goalObjective, s.goalStatus, s.goalTokensUsed = resp.Goal.Objective, resp.Goal.Status, resp.Goal.TokensUsed
+	info := core.GoalInfo{Objective: s.goalObjective, Status: s.goalStatus, TokensUsed: s.goalTokensUsed}
+	s.goalMu.Unlock()
+	s.stateMu.Lock()
+	s.lastNativeTurnActivity = time.Now()
+	s.stateMu.Unlock()
+	return info, nil
+}
+
+// GetGoal returns the cached state; it never performs a round-trip.
+func (s *appServerSession) GetGoal() core.GoalInfo {
+	s.goalMu.Lock()
+	defer s.goalMu.Unlock()
+	return core.GoalInfo{Objective: s.goalObjective, Status: s.goalStatus, TokensUsed: s.goalTokensUsed}
+}
+
+func (s *appServerSession) ClearGoal() error {
+	s.ClearMidTurnMessages()
+	threadID := s.CurrentSessionID()
+	if threadID == "" {
+		return fmt.Errorf("codex app-server thread id is empty")
+	}
+	s.goalMu.Lock()
+	s.goalClearInFlight = true
+	s.goalClearEarly = false
+	s.goalMu.Unlock()
+	var resp threadGoalClearResponse
+	err := s.request("thread/goal/clear", map[string]any{"threadId": threadID, "origin": "user"}, &resp)
+	s.goalMu.Lock()
+	if err == nil {
+		if resp.Cleared && !s.goalClearEarly {
+			s.goalClearPending++
+		}
+		s.goalSetAfterClear = false
+		s.goalObjective, s.goalStatus, s.goalTokensUsed = "", "", 0
+	}
+	s.goalClearInFlight = false
+	s.goalClearEarly = false
+	s.goalMu.Unlock()
+	if err == nil {
+		s.notifyWorkStateChanged()
+	}
+	return err
+}
+
+func (s *appServerSession) storeGoal(g threadGoal) {
+	s.goalMu.Lock()
+	newActive := strings.EqualFold(g.Status, "active") && (!strings.EqualFold(s.goalStatus, "active") || s.goalObjective != g.Objective)
+	s.goalObjective, s.goalStatus, s.goalTokensUsed = g.Objective, g.Status, g.TokensUsed
+	s.goalMu.Unlock()
+	if newActive {
+		s.stateMu.Lock()
+		s.lastNativeTurnActivity = time.Now()
+		s.stateMu.Unlock()
+	}
+	s.notifyWorkStateChanged()
+}
+
+// handleGoalUpdated mirrors a thread/goal/updated notification. A terminal
+// status (the goal will not start another round) becomes a one-line notice,
+// held back until the running turn's text has been delivered: codex marks the
+// goal complete seconds before that turn completes.
+func (s *appServerSession) handleGoalUpdated(g threadGoal) {
+	s.goalMu.Lock()
+	changed := !strings.EqualFold(s.goalStatus, g.Status)
+	s.goalMu.Unlock()
+	s.storeGoal(g)
+	s.signalDeferredMessages()
+	if !changed {
+		return
+	}
+	var notice string
+	switch strings.ToLower(g.Status) {
+	case "complete":
+		notice = fmt.Sprintf("goal 已达成：%s\n可以发 /goal clear 清除。", g.Objective)
+	case "paused":
+		notice = fmt.Sprintf("goal 已暂停：%s", g.Objective)
+	case "blocked", "usagelimited", "budgetlimited":
+		notice = fmt.Sprintf("goal 已停止（%s）：%s", g.Status, g.Objective)
+	default:
+		return
+	}
+	s.stateMu.Lock()
+	busy := s.currentTurn != ""
+	s.stateMu.Unlock()
+	if busy {
+		s.goalMu.Lock()
+		s.goalNotice = notice
+		s.goalMu.Unlock()
+		return
+	}
+	s.emit(core.Event{Type: core.EventGoal, Content: notice})
+}
+
+// flushGoalNotice releases a notice held by handleGoalUpdated (or by the
+// resume check) once it is safe to show it.
+func (s *appServerSession) flushGoalNotice(userTurn bool) {
+	s.goalMu.Lock()
+	resumeNotice := ""
+	if userTurn && s.resumeGoal != "" {
+		resumeNotice = fmt.Sprintf("上次的 goal 已在重启时清除（%s）。需要的话重新发 /goal。", s.resumeGoal)
+		s.resumeGoal = ""
+	}
+	notice := s.goalNotice
+	s.goalNotice = ""
+	s.goalMu.Unlock()
+	if resumeNotice != "" {
+		s.emit(core.Event{Type: core.EventGoal, Content: resumeNotice})
+	}
+	if notice != "" {
+		s.emit(core.Event{Type: core.EventGoal, Content: notice})
+	}
+}
+
+// syncGoalAfterResume refuses to leave an unattended goal running: if
+// cc-connect restarted while codex still had an active goal, resuming the
+// thread would spend quota with nobody watching. The goal is cleared and the
+// user is told on the next turn.
+func (s *appServerSession) syncGoalAfterResume() error {
+	threadID := s.CurrentSessionID()
+	if threadID == "" {
+		return fmt.Errorf("goal resume: empty thread id")
+	}
+	var resp threadGoalGetResponse
+	if err := s.request("thread/goal/get", map[string]any{"threadId": threadID}, &resp); err != nil {
+		return fmt.Errorf("codex app-server goal/get after resume: %w", err)
+	}
+	if resp.Goal == nil {
+		s.storeGoal(threadGoal{})
+		return nil
+	}
+	if !strings.EqualFold(resp.Goal.Status, "active") {
+		s.storeGoal(*resp.Goal)
+		return nil
+	}
+	objective := resp.Goal.Objective
+	s.storeGoal(*resp.Goal)
+	if err := s.ClearGoal(); err != nil {
+		return fmt.Errorf("codex app-server goal/clear after resume: %w", err)
+	}
+	s.goalMu.Lock()
+	s.resumeGoal = objective
+	s.goalMu.Unlock()
+	slog.Info("codex app-server goal cleared after resume", "thread_id", threadID)
+	return nil
 }
 
 func (s *appServerSession) flushPendingAsThinking() {

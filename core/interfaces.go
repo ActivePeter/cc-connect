@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -433,6 +434,76 @@ type AgentSession interface {
 type MidTurnMessageSender interface {
 	SendMidTurn(prompt, messageID string, images []ImageAttachment, files []FileAttachment) error
 }
+
+// DeferredMessageSender retains failed mid-turn input in the cc-connect
+// process until a steerable turn or an ordinary-input boundary is available.
+// Notify is called outside transport locks; canceled messages are counted by
+// ClearMidTurnMessages. Queues are session-local and never persisted.
+type DeferredMessageSender interface {
+	EnqueueMidTurn(DeferredMessage) error
+	PendingMidTurnMessages() int
+	ClearMidTurnMessages() int
+}
+type DeferredMessage struct {
+	Prompt, GoalObjective, MessageID string
+	Images                           []ImageAttachment
+	Files                            []FileAttachment
+	AsGoal, Attempted                bool
+	Notify                           func(status string, err error)
+}
+
+const (
+	DeferredInserted = "inserted"
+	DeferredSent     = "sent"
+	DeferredCanceled = "canceled"
+)
+
+// GoalInfo is a snapshot of a session-scoped native goal.
+type GoalInfo struct {
+	Objective  string
+	Status     string // codex: active|paused|blocked|usageLimited|budgetLimited|complete
+	TokensUsed int64
+}
+
+// Active reports whether the goal is still being pursued.
+func (g GoalInfo) Active() bool { return strings.EqualFold(g.Status, "active") }
+
+// GoalController is an optional session capability behind /goal. SetGoal
+// starts the agent's first work turn on its own and must not block until the
+// goal finishes; GetGoal is a cache read with no round-trip.
+type GoalController interface {
+	SetGoal(objective string) (GoalInfo, error)
+	GetGoal() GoalInfo
+	ClearGoal() error
+}
+
+// GoalAwareAgent marks agents whose sessions can carry a goal, so /goal can
+// tell "no goal mode, deliver the text to the agent" (Claude Code) from
+// "goal mode, but no live session yet" (codex app-server).
+type GoalAwareAgent interface{ SupportsGoalMode() bool }
+
+type goalQueryKey struct{}
+
+// GoalQueryContext prevents replacing a saved thread when a goal query resume fails.
+func GoalQueryContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, goalQueryKey{}, true)
+}
+
+// IsGoalQuery reports whether the startup is for a goal status/clear query.
+func IsGoalQuery(ctx context.Context) bool { return ctx.Value(goalQueryKey{}) == true }
+
+// GoalResumeNotice exposes a notice about a goal cleared on resume.
+type GoalResumeNotice interface {
+	GoalResumeNotice() string
+	AckGoalResumeNotice(string)
+}
+
+// GoalTurnRunning reports a background agent turn not represented by Session.Busy.
+type GoalTurnRunning interface{ GoalTurnRunning() bool }
+
+// EventGoal is a one-line goal notice (started, achieved, paused, cleared).
+// It is relayed as its own message and never ends a turn.
+const EventGoal EventType = "goal"
 
 // PermissionResult represents the user's decision on a permission request.
 type PermissionResult struct {

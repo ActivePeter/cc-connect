@@ -2656,3 +2656,79 @@ func TestCUJ_TF1_ParallelExecutorTopics(t *testing.T) {
 		t.Fatal("stop-all killed commander main")
 	}
 }
+
+// Interjecting in goal_mode=always must not replace the objective or consume
+// commands; status, clear, and stop retain their ordinary user-facing behavior.
+func TestCUJ_GoalSteer_InterjectStatusClearStop(t *testing.T) {
+	e, p, as, key := goalInjectFixture(t, true, false)
+	sendText(e, p, key, "remember this correction")
+	sendText(e, p, key, "/goal")
+	sendText(e, p, key, "/goal clear")
+	sendText(e, p, key, "/stop")
+	got := p.getSent()
+	if len(got) != 4 || got[0] != e.i18n.T(MsgMessageInjected) || !strings.Contains(got[1], "finish original goal") || !strings.Contains(got[2], "goal 已清除") {
+		t.Fatalf("replies: %v", got)
+	}
+	if len(as.injected) != 1 {
+		t.Fatalf("commands injected: %v", as.injected)
+	}
+	if info, clears, sets := as.state(); info.Active() || clears != 1 || sets != 0 {
+		t.Fatalf("goal: %v clear=%d set=%d", info, clears, sets)
+	}
+	waitFor(t, func() bool { return !as.Alive() }, 2*time.Second)
+}
+
+// Queue two interjections, clear the goal, then accept fresh input. Assert the
+// platform acknowledgements so a retained stale queue cannot look successful.
+func TestCUJ_GoalSteer_QueueClearDoesNotLeakIntoNextInput(t *testing.T) {
+	e, p, as, key := deferredFixture(t, true, false)
+	as.injectErr = fmt.Errorf("expired turn")
+	sendText(e, p, key, "first queued correction")
+	sendText(e, p, key, "second queued correction")
+	got := p.getSent()
+	if len(got) != 2 || got[0] != e.i18n.T(MsgDeferredMessageQueued) || got[1] != got[0] {
+		t.Fatalf("queue acknowledgements: %v", got)
+	}
+	sendText(e, p, key, "/goal clear")
+	got = p.getSent()
+	if len(got) != 4 || got[2] != e.i18n.Tf(MsgDeferredQueueCleared, 2) || !strings.Contains(got[3], "goal 已清除") {
+		t.Fatalf("clear acknowledgement: %v", got)
+	}
+	as.injectErr = nil
+	sendText(e, p, key, "fresh correction")
+	got = p.getSent()
+	if len(got) != 5 || got[4] != e.i18n.T(MsgMessageInjected) {
+		t.Fatalf("fresh input was held behind a canceled queue: %v", got)
+	}
+}
+
+// A user sees a queued second topic while the first executor continues its
+// native goal, can interject/clear/stop just that topic, then gets B's delivery.
+func TestCUJ_TF2_NativeGoalInterjectClearStopReleasesNextTopic(t *testing.T) {
+	e, p, a := twEnv(t, 1)
+	tfSend(e, p, "a", "/goal Finish the first task")
+	one := twNext(t, a, "Finish the first task")
+	tfSend(e, p, "b", "SECOND-TASK")
+	tfWait(t, func() bool { return tfSaw(p, "Queued;") })
+	one.complete("FIRST-TURN-DELIVERED", "active")
+	tfWait(t, func() bool { return tfSaw(p, "FIRST-TURN-DELIVERED") })
+	one.nativeStart()
+	tfSend(e, p, "a", "Keep the correction in the first task")
+	tfWait(t, func() bool { return tfSaw(p, e.i18n.T(MsgMessageInjected)) })
+	tfSend(e, p, "a", "/goal clear")
+	tfWait(t, func() bool { return tfSaw(p, "goal 已清除") })
+	twAssertNoStart(t, a)
+	tfSend(e, p, "a", "/stop")
+	two := twNext(t, a, "SECOND-TASK")
+	two.complete("SECOND-TASK-DELIVERED", "")
+	tfWait(t, func() bool { return tfSaw(p, "SECOND-TASK-DELIVERED") && tfSaw(p, e.i18n.T(MsgExecutionStopped)) })
+	visible := strings.Join(p.getSent(), "\n")
+	last := -1
+	for _, marker := range []string{"Queued;", "FIRST-TURN-DELIVERED", e.i18n.T(MsgMessageInjected), "goal 已清除", "SECOND-TASK-DELIVERED"} {
+		pos := strings.Index(visible, marker)
+		if pos <= last {
+			t.Fatalf("missing/reordered %q: %s", marker, visible)
+		}
+		last = pos
+	}
+}

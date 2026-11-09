@@ -75,8 +75,11 @@ const (
 )
 
 const (
-	replyFooterUsageTimeout  = 1500 * time.Millisecond
 	replyFooterUsageCacheTTL = 30 * time.Second
+	// replyFooterUsageProbeTimeout bounds the background usage refresh. It is
+	// deliberately larger than the old inline budget: the refresh no longer
+	// blocks a turn, so a slow probe is harmless.
+	replyFooterUsageProbeTimeout = 10 * time.Second
 )
 
 const (
@@ -346,12 +349,13 @@ type RateLimitCfg struct {
 
 // Engine routes messages between platforms and the agent for a single project.
 type Engine struct {
-	topicMu            sync.Mutex
-	topicGroups        map[string]*topicGroup
-	topicRecordsMu     sync.Mutex
-	topicCreateMu      sync.Mutex
-	topicRecordsLoaded bool
-	topicRecords       map[string]TopicRecord
+	topicMu              sync.Mutex
+	topicGroups          map[string]*topicGroup
+	topicGoalIdleTimeout time.Duration // zero uses the native 60s threshold
+	topicRecordsMu       sync.Mutex
+	topicCreateMu        sync.Mutex
+	topicRecordsLoaded   bool
+	topicRecords         map[string]TopicRecord
 
 	rotationLifecycle     map[string]int
 	rotationGeneration    map[string]uint64
@@ -472,12 +476,14 @@ type Engine struct {
 	// Interactive agent session management
 	interactiveMu     sync.Mutex
 	interactiveStates map[string]*interactiveState // key = sessionKey
+	goalModeAlways    bool
 
 	platformLifecycleMu sync.Mutex
 	platformReady       map[Platform]bool
 	stopping            bool
 	replyFooterMu       sync.Mutex
 	replyFooterUsage    replyFooterUsageCache
+	replyFooterRefresh  atomic.Bool // single-flight guard for the background refresh
 
 	// pendingRestartNotify is queued at startup if a /restart was consumed
 	// from the run/restart_notify file. It is dispatched on the first
@@ -514,28 +520,36 @@ type workspaceInitFlow struct {
 // The message is NOT sent to agent stdin at queue time; the event loop
 // sends it after the current turn completes to avoid mid-turn interference.
 type queuedMessage struct {
-	messageID         string
-	platform          Platform
-	replyCtx          any
-	content           string
-	images            []ImageAttachment
-	files             []FileAttachment
-	fromVoice         bool
-	userID            string
-	userName          string // sender's display name for sender injection
-	msgPlatform       string // platform name for sender injection
-	msgSessionKey     string // session key for extracting chat ID
-	channelKey        string // platform-provided channel identifier (preferred over sessionKey extraction)
-	userMessageTimeMs int64  // Feishu create_time ms (optional); see Message.UserMessageTimeMs
+	topicGoalSet        bool
+	topicGoalGeneration uint64
+	goalObjective       bool
+	goalAuto            bool
+	goalSeq             uint64
+	messageID           string
+	platform            Platform
+	replyCtx            any
+	content             string
+	images              []ImageAttachment
+	files               []FileAttachment
+	fromVoice           bool
+	userID              string
+	userName            string // sender's display name for sender injection
+	msgPlatform         string // platform name for sender injection
+	msgSessionKey       string // session key for extracting chat ID
+	channelKey          string // platform-provided channel identifier (preferred over sessionKey extraction)
+	userMessageTimeMs   int64  // Feishu create_time ms (optional); see Message.UserMessageTimeMs
 }
 
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
+	topicWork                *topicWorkWatcher // native delivery tracking; admission wake only for topic_only
+	rotationFinalizing       bool
 	rotationRouteKey         string
 	rotationRecovery         bool
 	rotationOutcome          rotationTurnOutcome
 	rotationCandidate        bool
 	logicalSessionID         string
+	deferredMu               sync.Mutex // serializes steer/queue routing and queue cancellation
 	agentSession             AgentSession
 	lastTurnSucceeded        bool
 	platform                 Platform
@@ -551,6 +565,8 @@ type interactiveState struct {
 	stopped                  bool
 	pending                  *pendingPermission
 	pendingMessages          []queuedMessage // messages queued while session was busy
+	goalControlMu            sync.Mutex      // serializes goal set/clear; acquired before mu
+	goalSeq                  uint64          // guarded by mu; invalidates queued goals on clear
 	midTurnReady             bool            // first input written; cleared before processing a terminal result
 	approveAll               bool            // when true, auto-approve all permission requests for this session
 	fromVoice                bool            // true if current turn originated from voice transcription
@@ -795,6 +811,8 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 // DefaultWorkspaceIdleTimeout is the default time a workspace can be idle
 // before the reaper reclaims it.
 const DefaultWorkspaceIdleTimeout = 15 * time.Minute
+
+func (e *Engine) SetGoalModeAlways(always bool) { e.goalModeAlways = always }
 
 // SetMultiWorkspace enables multi-workspace mode for the engine.
 func (e *Engine) SetMultiWorkspace(baseDir, bindingStorePath string) {
@@ -3042,6 +3060,43 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		return
 	}
 
+	// A native agent turn (including ordinary restart continuation) owns new
+	// input before always mode can infer another goal. Failed steers are kept
+	// in its in-memory FIFO until a turn/boundary can accept them.
+	if !msg.goalObjective && !strings.HasPrefix(content, "/") && e.handleDeferredMessage(p, msg, interactiveKey, sessions) {
+		return
+	}
+	// Interject into an existing goal before goal_mode=always interprets this
+	// message as a new objective. Automatic goal turns can run after the
+	// foreground session lock has been released. Commands stay on their path.
+	if !msg.goalObjective && !strings.HasPrefix(content, "/") && e.handleMessageForActiveGoal(p, msg, interactiveKey, sessions) {
+		return
+	}
+	if e.goalModeAlways && !strings.HasPrefix(content, "/") {
+		if ga, ok := agent.(GoalAwareAgent); ok && ga.SupportsGoalMode() {
+			msg.goalObjective = true
+			msg.goalAuto = true
+		}
+	}
+	if msg.goalObjective {
+		if len(msg.Images) > 0 || len(msg.Files) > 0 {
+			e.reply(p, msg.ReplyCtx, "goal 模式目前只支持文字，请发送不带附件的文字目标。")
+			return
+		}
+		if gc := e.liveGoalController(interactiveKey); gc != nil {
+			if gc.GetGoal().Active() {
+				e.reply(p, msg.ReplyCtx, "当前 goal 还在执行，先发 /goal clear 再设新目标。")
+				return
+			}
+			if running, ok := gc.(GoalTurnRunning); ok && running.GoalTurnRunning() && !sessions.GetOrCreateActive(msg.SessionKey).Busy() {
+				e.reply(p, msg.ReplyCtx, "没能开始，请重发。")
+				return
+			}
+		}
+	} else if e.blockMessageForActiveGoal(p, msg, interactiveKey) {
+		return
+	}
+
 	session := sessions.GetOrCreateActive(msg.SessionKey)
 	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
 	// Ensure an interactiveState entry exists before taking the session lock.
@@ -3056,7 +3111,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 			return
 		}
-		if e.injectUserMessageForBusySession(p, msg, interactiveKey, session, sessions) {
+		if !msg.goalObjective && e.injectUserMessageForBusySession(p, msg, interactiveKey, session, sessions) {
 			return
 		}
 		// Session is busy — try to queue the message for the running turn
@@ -3106,7 +3161,21 @@ sessionLocked:
 		"session", session.ID,
 	)
 
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+	if msg.goalObjective {
+		started := make(chan struct{})
+		var once sync.Once
+		msg.goalStarted = func() { once.Do(func() { close(started) }) }
+		go func() {
+			defer msg.goalStarted()
+			e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+		}()
+		select {
+		case <-started:
+		case <-e.ctx.Done():
+		}
+	} else {
+		go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+	}
 }
 
 func runMessageAccepted(msg *Message) {
@@ -3215,19 +3284,24 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		return true // handled: queue-full reply sent
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
-		messageID:         msg.MessageID,
-		platform:          p,
-		replyCtx:          msg.ReplyCtx,
-		content:           msg.Content,
-		images:            msg.Images,
-		files:             msg.Files,
-		fromVoice:         msg.FromVoice,
-		userID:            msg.UserID,
-		userName:          msg.UserName,
-		msgPlatform:       msg.Platform,
-		msgSessionKey:     msg.SessionKey,
-		channelKey:        msg.ChannelKey,
-		userMessageTimeMs: msg.UserMessageTimeMs,
+		topicGoalSet:        msg.topicGoalSet,
+		topicGoalGeneration: msg.topicGoalGeneration,
+		goalObjective:       msg.goalObjective,
+		goalAuto:            msg.goalAuto,
+		goalSeq:             state.goalSeq,
+		messageID:           msg.MessageID,
+		platform:            p,
+		replyCtx:            msg.ReplyCtx,
+		content:             msg.Content,
+		images:              msg.Images,
+		files:               msg.Files,
+		fromVoice:           msg.FromVoice,
+		userID:              msg.UserID,
+		userName:            msg.UserName,
+		msgPlatform:         msg.Platform,
+		msgSessionKey:       msg.SessionKey,
+		channelKey:          msg.ChannelKey,
+		userMessageTimeMs:   msg.UserMessageTimeMs,
 	})
 	runMessageAccepted(msg)
 	queueDepth := len(state.pendingMessages)
@@ -3245,7 +3319,11 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		"user", msg.UserName,
 		"queue_depth", queueDepth,
 	)
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	if msg.goalObjective {
+		e.reply(p, msg.ReplyCtx, "这一轮结束后开始执行 goal。")
+	} else {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	}
 	return true
 }
 
@@ -3794,7 +3872,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 	var state *interactiveState
 	if run == nil || !run.cancelled.Load() {
-		state = e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, msg.rotationState)
+		state = e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, interactiveStartOptions{Expected: msg.rotationState})
 	}
 	if run != nil {
 		if run.cancelled.Load() {
@@ -3805,6 +3883,8 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if state == nil {
 		return
 	}
+
+	e.watchTopicWork(msg.SessionKey, state)
 
 	// Set workspaceDir on the state for idle reaper identification
 	if workspaceDir != "" {
@@ -3886,7 +3966,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	needResync := state.eventsNeedResync
 	state.mu.Unlock()
 	if needResync {
-		drainEvents(state.agentSession.Events())
+		e.drainAgentEvents(state, session, sessions, interactiveKey)
 	}
 
 	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
@@ -3915,7 +3995,19 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			sendDone <- fmt.Errorf("agent session became nil")
 			return
 		}
-		err := sendForegroundMessage(state, as, promptContent, msg.MessageID, msg.Images, msg.Files)
+		var err error
+		if msg.goalObjective {
+			state.goalControlMu.Lock()
+			if !e.topicGoalCurrent(msg) {
+				err = errGoalCanceled
+			} else {
+				err = e.sendGoalForState(state, as, msg.Content, p, msg.ReplyCtx)
+			}
+			state.goalControlMu.Unlock()
+			msg.goalStarted()
+		} else {
+			err = sendForegroundMessage(state, as, promptContent, msg.MessageID, msg.Images, msg.Files)
+		}
 		if first := session.FirstInput(); first != nil && first.State == "in_flight" {
 			receipt := "accepted"
 			if err != nil {
@@ -4098,6 +4190,7 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 		return
 	}
 	existing.mu.Lock()
+	newState.goalSeq = existing.goalSeq
 	if len(existing.pendingMessages) > 0 {
 		newState.pendingMessages = existing.pendingMessages
 		existing.pendingMessages = nil
@@ -4107,7 +4200,19 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 
 // When agentOverride is non-nil it is used instead of e.agent to start the session.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, expected ...*interactiveState) *interactiveState {
+type interactiveStartOptions struct {
+	Expected  *interactiveState
+	GoalQuery bool
+}
+
+// Goal queries preserve the saved ID; rotation starts can require a specific state generation.
+func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, opts ...interactiveStartOptions) *interactiveState {
+	var expected []*interactiveState
+	goalQuery := false
+	if len(opts) > 0 {
+		expected = append(expected, opts[0].Expected)
+		goalQuery = opts[0].GoalQuery
+	}
 	e.interactiveMu.Lock()
 	defer e.interactiveMu.Unlock()
 
@@ -4212,6 +4317,12 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// resume a conversation that has nothing to do with this project.
 	if startSessionID != "" {
 		if validator, ok := agent.(SessionIDValidator); ok && !validator.ValidateSessionID(e.ctx, startSessionID) {
+			if goalQuery {
+				state := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true}
+				adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], state)
+				e.interactiveStates[sessionKey] = state
+				return state
+			}
 			slog.Warn("session ID does not belong to this project, clearing it",
 				"session_key", sessionKey, "invalid_session_id", startSessionID)
 			session.SetAgentSessionID("", agent.Name())
@@ -4221,11 +4332,15 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 	isResume := startSessionID != ""
 	startAt := time.Now()
-	agentSession, err := agent.StartSession(e.ctx, startSessionID)
+	startCtx := e.ctx
+	if goalQuery {
+		startCtx = GoalQueryContext(startCtx)
+	}
+	agentSession, err := agent.StartSession(startCtx, startSessionID)
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		// If resume/continue failed, try a fresh session as fallback.
-		if startSessionID != "" {
+		if startSessionID != "" && !goalQuery {
 			slog.Error("session resume failed, falling back to fresh session",
 				"session_key", sessionKey, "failed_session_id", startSessionID,
 				"error", err, "elapsed", startElapsed)
@@ -4703,6 +4818,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				state.mu.Lock()
 				state.eventsNeedResync = true
 				state.mu.Unlock()
+				e.discardNativeResult(state, session, sessions, sessionKey, event)
 				return
 			default:
 			}
@@ -4725,6 +4841,15 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 			state.mu.Unlock()
 
 			switch event.Type {
+			case EventGoal:
+				// Goal notices (achieved, paused, ...) are relayed as their own
+				// message; they are not part of textParts and never close a turn.
+				if strings.TrimSpace(event.Content) != "" {
+					if err := e.sendWithError(p, replyCtx, event.Content); err != nil {
+						slog.Debug("unsolicited goal notice send failed", "error", err)
+					}
+				}
+
 			case EventText:
 				if event.Content != "" {
 					textParts = append(textParts, event.Content)
@@ -4798,6 +4923,10 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				// when the original idle timer fires. See #1686 P1-C P1-1.
 				e.scheduleAgentSessionIdleClose(sessionKey, state)
 
+				if event.Done {
+					e.topicDeliveryFinished(state)
+					e.finishNativeRotation(state, session, sessions, sessionKey, event.Done, delivered)
+				}
 				slog.Info("unsolicited turn complete",
 					"session", sessionKey,
 					"response_len", len(fullResponse))
@@ -5009,6 +5138,16 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 		case err := <-pendingSend:
 			pendingSend = nil
+			if errors.Is(err, errGoalCanceled) {
+				return
+			}
+			if errors.Is(err, errGoalBusy) {
+				state.mu.Lock()
+				p := state.platform
+				state.mu.Unlock()
+				e.reply(p, replyCtx, "没能开始，请重发。")
+				return
+			}
 			if err != nil {
 				slog.Error("failed to send prompt", "error", err, "session_key", sessionKey)
 				sp.discard()
@@ -5145,6 +5284,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 
 		switch event.Type {
+		case EventGoal:
+			// Goal lifecycle notices are their own short message; they never
+			// belong to the turn's reply text and do not end the turn.
+			if strings.TrimSpace(event.Content) != "" {
+				e.send(p, replyCtx, event.Content)
+			}
 		case EventThinking:
 			if isEllipsisOnly(event.Content) {
 				break
@@ -5678,6 +5823,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				)
 				continue
 			}
+			defer e.topicDeliveryFinished(state)
 			state.mu.Lock()
 			state.midTurnReady = false
 			state.mu.Unlock()
@@ -6101,6 +6247,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 				state.mu.Unlock()
 
+				if !queued.goalObjective && e.blockMessageForActiveGoal(queued.platform, &Message{ReplyCtx: queued.replyCtx}, sessionKey) {
+					return
+				}
 				// Stop the previous turn's typing indicator
 				if stopTyping != nil {
 					stopTyping()
@@ -6116,7 +6265,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// Drain stale events before starting the next turn. Between
 				// EventResult and Send(), the only buffered events would be
 				// stale leftovers (e.g. a deferred EventError from cmd.Wait()).
-				drainEvents(state.agentSession.Events())
+				e.drainAgentEvents(state, session, sessions, sessionKey)
 
 				if pendingSend != nil {
 					if err := <-pendingSend; err != nil {
@@ -6140,7 +6289,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						nextSend <- fmt.Errorf("agent session became nil")
 						return
 					}
-					nextSend <- sendForegroundMessage(state, as, queuedPrompt, queued.messageID, queued.images, queued.files)
+					if queued.goalObjective {
+						nextSend <- e.sendQueuedGoal(state, as, queued.goalSeq, queued.content, queued.platform, queued.replyCtx, queued)
+					} else {
+						nextSend <- sendForegroundMessage(state, as, queuedPrompt, queued.messageID, queued.images, queued.files)
+					}
 				}()
 				pendingSend = nextSend
 
@@ -6469,6 +6622,9 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 		state.mu.Unlock()
 
+		if !queued.goalObjective && e.blockMessageForActiveGoal(queued.platform, &Message{ReplyCtx: queued.replyCtx}, sessionKey) {
+			continue
+		}
 		e.i18n.DetectAndSet(queued.content)
 		prompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
 
@@ -6481,7 +6637,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			return false
 		}
 
-		drainEvents(as.Events())
+		e.drainAgentEvents(state, session, sessions, sessionKey)
 
 		session.AddHistory("user", queued.content)
 
@@ -6491,7 +6647,11 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 				sendDone <- fmt.Errorf("agent session became nil")
 				return
 			}
-			sendDone <- sendForegroundMessage(state, as, prompt, queued.messageID, queued.images, queued.files)
+			if queued.goalObjective {
+				sendDone <- e.sendQueuedGoal(state, as, queued.goalSeq, queued.content, queued.platform, queued.replyCtx, queued)
+			} else {
+				sendDone <- sendForegroundMessage(state, as, prompt, queued.messageID, queued.images, queued.files)
+			}
 		}()
 
 		var stopTyping func()
@@ -6537,6 +6697,7 @@ var builtinCommands = []struct {
 	{[]string{"cron"}, "cron"},
 	{[]string{"timer", "at", "remind"}, "timer"},
 	{[]string{"heartbeat", "hb"}, "heartbeat"},
+	{[]string{"goal"}, "goal"},
 	{[]string{"compress", "compact"}, "compress"},
 	{[]string{"stop"}, "stop"},
 	{[]string{"cancel"}, "cancel"},
@@ -6592,6 +6753,255 @@ func (e *Engine) cmdPs(p Platform, msg *Message, args []string) {
 		return
 	}
 	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSent))
+}
+
+// ── /goal ──────────────────────────────────────────────────────
+
+// liveGoalController returns the goal capability of the live session for
+// interactiveKey, or nil. GetGoal is a cache read, so this is cheap enough
+// for the message path.
+func (e *Engine) liveGoalController(interactiveKey string) GoalController {
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[interactiveKey]
+	e.interactiveMu.Unlock()
+	if state == nil {
+		return nil
+	}
+	state.mu.Lock()
+	as := state.agentSession
+	state.mu.Unlock()
+	if as == nil || !as.Alive() {
+		return nil
+	}
+	gc, _ := as.(GoalController)
+	return gc
+}
+
+// blockMessageForActiveGoal retains the command/queued-message rejection path.
+func (e *Engine) blockMessageForActiveGoal(p Platform, msg *Message, interactiveKey string) bool {
+	return e.handleMessageForActiveGoal(p, msg, interactiveKey, nil)
+}
+
+// handleMessageForActiveGoal tries mid-turn delivery for incoming platform text,
+// including autonomous goal turns. On failure, retain the explicit rejection;
+// never queue a new foreground turn alongside automatic continuation or
+// acknowledge a message the agent did not accept.
+func (e *Engine) handleMessageForActiveGoal(p Platform, msg *Message, interactiveKey string, sessions *SessionManager) bool {
+	gc := e.liveGoalController(interactiveKey)
+	if gc == nil {
+		return false
+	}
+	info := gc.GetGoal()
+	if !info.Active() {
+		return false
+	}
+	if sessions != nil && len(msg.Images) == 0 && len(msg.Files) == 0 && e.injectUserMessageForBusySession(p, msg, interactiveKey, sessions.GetOrCreateActive(msg.SessionKey), sessions) {
+		return true
+	}
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf("goal 进行中：%s\n等它达成，或先发 /goal clear，再发新消息。", info.Objective))
+	return true
+}
+
+var errGoalBusy = errors.New("queued goal is busy")
+var errGoalCanceled = errors.New("queued goal canceled")
+
+func (e *Engine) sendQueuedGoal(state *interactiveState, as AgentSession, seq uint64, objective string, p Platform, replyCtx any, queued ...queuedMessage) error {
+	state.goalControlMu.Lock()
+	defer state.goalControlMu.Unlock()
+	state.mu.Lock()
+	canceled := seq != state.goalSeq
+	state.mu.Unlock()
+	if !canceled && len(queued) > 0 {
+		q := queued[0]
+		canceled = !e.topicGoalCurrent(&Message{SessionKey: q.msgSessionKey, topicGoalSet: q.topicGoalSet, topicGoalGeneration: q.topicGoalGeneration})
+	}
+	if canceled {
+		return errGoalCanceled
+	}
+	gc, ok := as.(GoalController)
+	if !ok {
+		return fmt.Errorf("agent session does not support goals")
+	}
+	running, hasRunning := as.(GoalTurnRunning)
+	if len(queued) > 0 && queued[0].goalAuto {
+		if queue, ok := as.(DeferredMessageSender); ok {
+			state.deferredMu.Lock()
+			defer state.deferredMu.Unlock()
+			q := queued[0]
+			_, sessions := e.sessionContextForKey(q.msgSessionKey)
+			msg := &Message{SessionKey: q.msgSessionKey, Content: q.content, MessageID: q.messageID, ReplyCtx: q.replyCtx, UserID: q.userID, UserName: q.userName, Platform: q.msgPlatform, ChannelKey: q.channelKey}
+			e.enqueueDeferredMessage(p, msg, q.msgSessionKey, state, queue, sessions, false, true)
+			return nil
+		}
+	}
+	if gc.GetGoal().Active() || (hasRunning && running.GoalTurnRunning()) {
+		return errGoalBusy
+	}
+	return e.sendGoalForState(state, as, objective, p, replyCtx)
+}
+
+func (e *Engine) sendGoal(as AgentSession, objective string, p Platform, replyCtx any) error {
+	gc, ok := as.(GoalController)
+	if !ok {
+		return fmt.Errorf("agent session does not support goals")
+	}
+	if notice, ok := as.(GoalResumeNotice); ok {
+		if old := notice.GoalResumeNotice(); old != "" {
+			if err := e.replyWithError(p, replyCtx, fmt.Sprintf("上次的 goal 已在重启时清除（%s）。", old)); err != nil {
+				return err
+			}
+			notice.AckGoalResumeNotice(old)
+		}
+	}
+	info, err := gc.SetGoal(objective)
+	if err != nil {
+		return err
+	}
+	e.reply(p, replyCtx, fmt.Sprintf("goal 已设置（%s）：%s\n达成或要停止时发 /goal clear。", info.Status, info.Objective))
+	return nil
+}
+
+// cmdGoal handles /goal, /goal <condition> and /goal clear. Returns false
+// when the text should go to the agent verbatim (agents with a native /goal,
+// e.g. Claude Code).
+func (e *Engine) cmdGoal(p Platform, msg *Message, args []string) bool {
+	defer e.topicIdle(msg.SessionKey)
+	agent, sessions, interactiveKey, workspaceDir, err := e.commandContextWithWorkspace(p, msg)
+	if forced := e.sendWorkDirForSession(msg.SessionKey); forced != "" {
+		agent, sessions, err = e.getOrCreateWorkspaceAgent(forced)
+		interactiveKey, workspaceDir = forced+":"+msg.SessionKey, forced
+	}
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return true
+	}
+	arg := strings.TrimSpace(strings.Join(args, " "))
+	if e.isTopicRoute(p, msg) {
+		if strings.EqualFold(arg, "status") {
+			arg = ""
+		}
+		if strings.EqualFold(arg, "clear") {
+			if n := e.clearTopicQueuedGoals(msg.SessionKey); n > 0 {
+				e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDeferredQueueCleared, n))
+			}
+		}
+	}
+	gc := e.liveGoalController(interactiveKey)
+	ga, capable := agent.(GoalAwareAgent)
+	if gc == nil && (!capable || !ga.SupportsGoalMode()) {
+		return false
+	}
+	if arg != "" && !strings.EqualFold(arg, "clear") {
+		msg.Content, msg.goalObjective = arg, true
+		if msg.ExtraContent != "" {
+			msg.Content = msg.ExtraContent + "\n" + arg
+		}
+		return false
+	}
+	if gc == nil {
+		session := sessions.GetOrCreateActive(msg.SessionKey)
+		if session.GetAgentSessionID() == "" {
+			e.reply(p, msg.ReplyCtx, "当前没有 goal。")
+			return true
+		}
+		if !session.TryLock() {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
+			return true
+		}
+		state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agent, msg.SessionKey, interactiveStartOptions{GoalQuery: true})
+		defer func() {
+			state.mu.Lock()
+			if len(state.pendingMessages) == 0 {
+				session.UnlockWithoutUpdate()
+				state.mu.Unlock()
+				return
+			}
+			state.mu.Unlock()
+			go e.drainOrphanedQueue(session, sessions, interactiveKey, agent, workspaceDir)
+		}()
+		state.mu.Lock()
+		state.workspaceDir = workspaceDir
+		as := state.agentSession
+		state.mu.Unlock()
+		if as != nil {
+			gc, _ = as.(GoalController)
+		}
+		if gc == nil {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
+			return true
+		}
+		e.watchTopicWork(msg.SessionKey, state)
+		e.startUnsolicitedReader(state, session, sessions, interactiveKey, workspaceDir)
+		e.scheduleAgentSessionIdleClose(interactiveKey, state)
+	}
+	notice, _ := gc.(GoalResumeNotice)
+	old := ""
+	if notice != nil && gc.GetGoal().Objective == "" {
+		old = notice.GoalResumeNotice()
+	}
+	if arg == "" && old != "" {
+		if e.replyWithError(p, msg.ReplyCtx, fmt.Sprintf("当前没有 goal（上次的已在重启时清除：%s）。", old)) == nil {
+			notice.AckGoalResumeNotice(old)
+		}
+		return true
+	}
+	switch {
+	case arg == "":
+		info := gc.GetGoal()
+		if info.Objective == "" {
+			e.reply(p, msg.ReplyCtx, "当前没有 goal。用法：/goal 完成条件")
+			return true
+		}
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("goal：%s\n状态：%s\n已用 token：%d", info.Objective, info.Status, info.TokensUsed))
+	case strings.EqualFold(arg, "clear"):
+		if n := e.clearDeferredMessageQueue(interactiveKey); n > 0 {
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDeferredQueueCleared, n))
+		}
+		e.interactiveMu.Lock()
+		state := e.interactiveStates[interactiveKey]
+		e.interactiveMu.Unlock()
+		canceled := false
+		if state != nil {
+			state.goalControlMu.Lock()
+			defer state.goalControlMu.Unlock()
+			state.mu.Lock()
+			state.goalSeq++
+			pending := state.pendingMessages[:0]
+			for _, item := range state.pendingMessages {
+				if item.goalObjective {
+					canceled = true
+				} else {
+					pending = append(pending, item)
+				}
+			}
+			state.pendingMessages = pending
+			state.mu.Unlock()
+		}
+		if gc.GetGoal().Objective == "" {
+			if old != "" {
+				reply := fmt.Sprintf("当前没有 goal（上次的已在重启时清除：%s）。", old)
+				if canceled {
+					reply += " 排队的 goal 已取消。"
+				}
+				if e.replyWithError(p, msg.ReplyCtx, reply) == nil {
+					notice.AckGoalResumeNotice(old)
+				}
+			} else if canceled {
+				e.reply(p, msg.ReplyCtx, "排队的 goal 已取消。")
+			} else {
+				e.reply(p, msg.ReplyCtx, "当前没有 goal。")
+			}
+			return true
+		}
+		if err := gc.ClearGoal(); err != nil {
+			slog.Error("goal: clear failed", "session", msg.SessionKey, "error", err)
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("清除 goal 失败：%v", err))
+			return true
+		}
+		e.reply(p, msg.ReplyCtx, "goal 已清除。")
+
+	}
+	return true
 }
 
 // matchPrefix finds a unique command matching the given prefix.
@@ -6755,6 +7165,13 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdTimer(p, msg, args)
 	case "heartbeat":
 		e.cmdHeartbeat(p, msg, args)
+	case "goal":
+		if !e.cmdGoal(p, msg, args) {
+			// Agent has no native goal command of its own either (e.g. Claude
+			// Code has one): fall through and deliver the raw text as a normal
+			// user message instead of answering "unknown command".
+			return false
+		}
 	case "compress":
 		e.cmdCompress(p, msg)
 	case "stop":
@@ -7090,6 +7507,10 @@ func (e *Engine) handleWorkspaceCommand(p Platform, msg *Message, args []string)
 }
 
 func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
+	if e.isTopicRoute(p, msg) {
+		e.cancelTopic(msg.SessionKey)
+		defer e.topicIdle(msg.SessionKey)
+	}
 	if true {
 		done := e.beginRotationLifecycle(msg.SessionKey)
 		defer done()
@@ -7640,41 +8061,53 @@ func replyFooterReasoningEffort(session AgentSession, agent Agent) string {
 	return ""
 }
 
+// replyFooterUsageText serves the cached usage text; it never probes here,
+// because a stuck probe would leave the turn unfinished (claude /usage pty).
 func (e *Engine) replyFooterUsageText(session AgentSession, agent Agent) string {
-	ctx, cancel := context.WithTimeout(e.ctx, replyFooterUsageTimeout)
-	defer cancel()
-
-	if session != nil {
-		if reporter, ok := session.(UsageReporter); ok {
-			if report, err := reporter.GetUsage(ctx); err == nil {
-				return formatReplyFooterUsage(report, e.i18n)
-			}
-		}
-	}
-
-	reporter, ok := agent.(UsageReporter)
-	if !ok {
-		return ""
-	}
-
 	e.replyFooterMu.Lock()
 	cached := e.replyFooterUsage
 	e.replyFooterMu.Unlock()
-	if !cached.fetchedAt.IsZero() && time.Since(cached.fetchedAt) < replyFooterUsageCacheTTL {
-		return cached.text
+	if cached.fetchedAt.IsZero() || time.Since(cached.fetchedAt) >= replyFooterUsageCacheTTL {
+		e.refreshReplyFooterUsage(session, agent)
 	}
+	return cached.text
+}
 
-	text := ""
-	if report, err := reporter.GetUsage(ctx); err == nil {
-		text = formatReplyFooterUsage(report, e.i18n)
-	} else if !cached.fetchedAt.IsZero() {
-		text = cached.text
+// refreshReplyFooterUsage starts at most one background usage probe; a failed
+// probe keeps the old text and still stamps fetchedAt to avoid per-turn churn.
+func (e *Engine) refreshReplyFooterUsage(session AgentSession, agent Agent) {
+	if !e.replyFooterRefresh.CompareAndSwap(false, true) {
+		return
 	}
+	go func() {
+		defer e.replyFooterRefresh.Store(false)
+		ctx, cancel := context.WithTimeout(e.ctx, replyFooterUsageProbeTimeout)
+		defer cancel()
 
-	e.replyFooterMu.Lock()
-	e.replyFooterUsage = replyFooterUsageCache{text: text, fetchedAt: time.Now()}
-	e.replyFooterMu.Unlock()
-	return text
+		text := ""
+		if session != nil {
+			if reporter, ok := session.(UsageReporter); ok {
+				if report, err := reporter.GetUsage(ctx); err == nil {
+					text = formatReplyFooterUsage(report, e.i18n)
+				}
+			}
+		}
+		if text == "" {
+			if reporter, ok := agent.(UsageReporter); ok {
+				if report, err := reporter.GetUsage(ctx); err == nil {
+					text = formatReplyFooterUsage(report, e.i18n)
+				}
+			}
+		}
+
+		e.replyFooterMu.Lock()
+		if text == "" {
+			e.replyFooterUsage.fetchedAt = time.Now()
+		} else {
+			e.replyFooterUsage = replyFooterUsageCache{text: text, fetchedAt: time.Now()}
+		}
+		e.replyFooterMu.Unlock()
+	}()
 }
 
 func formatReplyFooterUsage(report *UsageReport, i18n *I18n) string {
@@ -10300,6 +10733,9 @@ func (e *Engine) cmdStop(p Platform, msg *Message) {
 	e.cancelTopic(msg.SessionKey)
 	defer e.topicIdle(msg.SessionKey)
 
+	if n := e.clearDeferredMessageQueue(e.interactiveKeyForSessionKey(msg.SessionKey)); n > 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDeferredQueueCleared, n))
+	}
 	// /stop only tears down the live agent process; it preserves the stored
 	// AgentSessionID so the next message can --resume the conversation. This
 	// matches the card-button stop path (see executeCardAction "/stop"). The
@@ -10327,6 +10763,10 @@ func (e *Engine) cmdStop(p Platform, msg *Message) {
 // Unlike /stop which only halts execution, /cancel also resets the session
 // so the user can immediately continue with new instructions.
 func (e *Engine) cmdCancel(p Platform, msg *Message) {
+	if e.isTopicRoute(p, msg) {
+		e.cancelTopic(msg.SessionKey)
+		defer e.topicIdle(msg.SessionKey)
+	}
 	if true {
 		done := e.beginRotationLifecycle(msg.SessionKey)
 		defer done()
@@ -10521,7 +10961,7 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 	state.replyCtx = replyCtx
 	state.mu.Unlock()
 
-	drainEvents(state.agentSession.Events())
+	e.drainAgentEvents(state, session, sessions, iKey)
 
 	compressor, ok := e.agent.(ContextCompressor)
 	if !ok || compressor.CompressCommand() == "" {

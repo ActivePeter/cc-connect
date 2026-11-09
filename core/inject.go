@@ -27,8 +27,8 @@ var ErrInjectUnsupported = errors.New("agent does not support mid-turn injection
 // write, the message starts a turn of its own that the unsolicited reader
 // relays like any between-turn output.
 //
-// When no foreground turn is running it returns InjectIdle and writes
-// nothing; the caller then delivers the message through the normal path
+// When neither a foreground nor an autonomous goal turn is running it returns
+// InjectIdle and writes nothing; the caller then delivers through the normal path
 // (a timer), which starts a turn properly.
 func (e *Engine) InjectToBusySession(sessionKey, prompt string) (string, error) {
 	if sessionKey == "" || prompt == "" {
@@ -36,9 +36,9 @@ func (e *Engine) InjectToBusySession(sessionKey, prompt string) (string, error) 
 	}
 	_, sessions := e.sessionContextForKey(sessionKey)
 	session := sessions.GetOrCreateActive(sessionKey)
-	if session.TryLock() {
+	foregroundBusy := !session.TryLock()
+	if !foregroundBusy {
 		session.UnlockWithoutUpdate()
-		return InjectIdle, nil
 	}
 
 	iKey := e.interactiveKeyForSessionKey(sessionKey)
@@ -56,6 +56,10 @@ func (e *Engine) InjectToBusySession(sessionKey, prompt string) (string, error) 
 	}
 
 	state.mu.Lock()
+	if !foregroundBusy && !agentTurnRunning(state.agentSession) {
+		state.mu.Unlock()
+		return InjectIdle, nil
+	}
 	status, err := injectIntoStateLocked(state, prompt, "", nil, nil)
 	state.mu.Unlock()
 	if err != nil || status != InjectInjected {
@@ -76,13 +80,20 @@ func injectIntoStateLocked(state *interactiveState, prompt, messageID string, im
 	if !ok {
 		return "", ErrInjectUnsupported
 	}
-	if !state.midTurnReady {
+	if !state.midTurnReady && !agentTurnRunning(state.agentSession) {
 		return InjectIdle, nil
 	}
 	if err := sender.SendMidTurn(prompt, messageID, images, files); err != nil {
 		return "", fmt.Errorf("inject: %w", err)
 	}
 	return InjectInjected, nil
+}
+
+// agentTurnRunning also covers ordinary and finishing Codex turns outside
+// the foreground lock. Before the first real turn it remains false.
+func agentTurnRunning(as AgentSession) bool {
+	running, ok := as.(GoalTurnRunning)
+	return ok && running.GoalTurnRunning()
 }
 
 // sendForegroundMessage arms injection only after the initial input has been

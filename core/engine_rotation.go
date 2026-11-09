@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"time"
 )
+
+var ErrRotationNativeBusy = errors.New("session new refused: native work remains")
 
 type rotationTurnOutcome struct{ Complete, Delivered bool }
 
@@ -79,6 +82,16 @@ func (e *Engine) ScheduleRotation(req RotateRequest) (RotationOperation, error) 
 			return RotationOperation{}, err
 		}
 	}
+	unlockWork, workErr := e.rotationWorkGate(e.interactiveKeyForSessionKey(req.SessionKey), false)
+	if workErr != nil {
+		return RotationOperation{}, workErr
+	}
+	workGateHeld := true
+	defer func() {
+		if workGateHeld {
+			unlockWork()
+		}
+	}()
 	e.rotationMu.Lock()
 	if e.rotationLifecycle[req.SessionKey] > 0 {
 		e.rotationMu.Unlock()
@@ -90,8 +103,15 @@ func (e *Engine) ScheduleRotation(req RotateRequest) (RotationOperation, error) 
 		return op, err
 	}
 	locked := old.TryLock()
+	// Coordinate the native completion worker with relinquishing this reservation.
+	nativeWaiting := locked && e.nativeDeliveryOutstanding(req.SessionKey)
+	if nativeWaiting {
+		old.UnlockWithoutUpdate()
+	}
 	e.rotationMu.Unlock()
-	if !locked {
+	unlockWork()
+	workGateHeld = false
+	if !locked || nativeWaiting {
 		return op, nil
 	}
 	key := e.interactiveKeyForSessionKey(req.SessionKey)
@@ -163,7 +183,7 @@ func (e *Engine) performRotation(state *interactiveState, old *Session, sm *Sess
 	}
 	generation := e.rotationGeneration[key]
 	e.rotationMu.Unlock()
-	defer func() { e.rotationMu.Lock(); delete(e.rotationWorkers, key); e.rotationMu.Unlock() }()
+	defer func() { e.rotationMu.Lock(); delete(e.rotationWorkers, key); e.rotationMu.Unlock(); e.topicIdle(ccKey) }()
 	fail := func(err error) (bool, error) {
 		if saveErr := sm.FinishRotation(op.RequestID, "FAILED", err.Error()); saveErr != nil {
 			slog.Error("rotation failure receipt", "error", saveErr)
@@ -185,6 +205,12 @@ func (e *Engine) performRotation(state *interactiveState, old *Session, sm *Sess
 		e.rotationMu.Unlock()
 		return false, err
 	}
+	unlockWork, workErr := e.rotationWorkStateGate(state, true)
+	if workErr != nil {
+		return fail(workErr)
+	}
+	unlockWork()
+	defer func() { state.mu.Lock(); state.rotationFinalizing = false; state.mu.Unlock() }()
 	e.stopUnsolicitedReader(state)
 	state.mu.Lock()
 	agent := state.agent
@@ -276,6 +302,7 @@ func (e *Engine) performRotation(state *interactiveState, old *Session, sm *Sess
 		eventsNeedResync: true, rotationCandidate: true, logicalSessionID: fresh.ID, rotationRouteKey: ccKey}
 	e.interactiveMu.Lock()
 	state.mu.Lock()
+	newState.goalSeq = state.goalSeq
 	newState.pendingMessages = state.pendingMessages
 	newState.lastCompletedUserMessageTimeMs = state.lastCompletedUserMessageTimeMs
 	state.pendingMessages = nil
@@ -368,7 +395,7 @@ func (e *Engine) processRotationFailureQueue(state *interactiveState, session *S
 		agent, _ = e.sessionContextForKey(sm.KeyForSession(session.ID))
 	}
 	msg := &Message{Platform: q.msgPlatform, SessionKey: q.msgSessionKey, ChannelKey: q.channelKey, UserID: q.userID, UserName: q.userName,
-		Content: q.content, MessageID: q.messageID, Images: q.images, Files: q.files, FromVoice: q.fromVoice, UserMessageTimeMs: q.userMessageTimeMs, ReplyCtx: q.replyCtx}
+		Content: q.content, goalObjective: q.goalObjective, goalAuto: q.goalAuto, topicGoalSet: q.topicGoalSet, topicGoalGeneration: q.topicGoalGeneration, MessageID: q.messageID, Images: q.images, Files: q.files, FromVoice: q.fromVoice, UserMessageTimeMs: q.userMessageTimeMs, ReplyCtx: q.replyCtx}
 	if msg.SessionKey == "" {
 		msg.SessionKey = sm.KeyForSession(session.ID)
 	}
@@ -454,4 +481,90 @@ func (e *Engine) rotationMessageKey(key string) string {
 		}
 	}
 	return rotationSessionKey(key)
+}
+
+// Lock order matches sendQueuedGoal: goalControlMu -> deferredMu -> state.mu.
+// No backend RPC, close or platform delivery runs while these gates are held.
+func (e *Engine) rotationWorkGate(key string, finalizing bool) (func(), error) {
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	if state == nil {
+		return func() {}, nil
+	}
+	return e.rotationWorkStateGate(state, finalizing)
+}
+func (e *Engine) rotationWorkStateGate(state *interactiveState, finalizing bool) (func(), error) {
+	state.goalControlMu.Lock()
+	state.deferredMu.Lock()
+	unlock := func() { state.deferredMu.Unlock(); state.goalControlMu.Unlock() }
+	state.mu.Lock()
+	as, busy := state.agentSession, state.rotationFinalizing
+	state.mu.Unlock()
+	var err error
+	// Registration may supersede a candidate while it is being prepared.
+	// Only a second finalizer is rejected; native writes remain gated.
+	if busy && finalizing {
+		err = fmt.Errorf("session rotation is already finalizing")
+	}
+	if as != nil && as.Alive() {
+		if gc, ok := as.(GoalController); ok && gc.GetGoal().Active() {
+			err = fmt.Errorf("%w: goal is active; clear it before rotating", ErrRotationNativeBusy)
+		}
+		if q, ok := as.(DeferredMessageSender); ok && q.PendingMidTurnMessages() > 0 {
+			err = fmt.Errorf("%w: deferred input is queued or being delivered", ErrRotationNativeBusy)
+		}
+	}
+	if err != nil {
+		unlock()
+		return func() {}, err
+	}
+	if finalizing {
+		state.mu.Lock()
+		state.rotationFinalizing = true
+		state.mu.Unlock()
+	}
+	return unlock, nil
+}
+func (e *Engine) sendGoalForState(state *interactiveState, as AgentSession, objective string, p Platform, rc any) error {
+	state.mu.Lock()
+	finalizing := state.rotationFinalizing
+	state.mu.Unlock()
+	if finalizing {
+		return fmt.Errorf("session rotation is finalizing; goal was not started")
+	}
+	return e.sendGoal(as, objective, p, rc)
+}
+
+func (e *Engine) nativeDeliveryOutstanding(route string) bool {
+	key := e.interactiveKeyForSessionKey(route)
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	as, w := state.agentSession, state.topicWork
+	state.mu.Unlock()
+	return as != nil && as.Alive() && (agentTurnRunning(as) || (w != nil && w.as == as && w.deliveryOutstanding()))
+}
+func (e *Engine) finishNativeRotation(state *interactiveState, session *Session, sm *SessionManager, key string, complete, delivered bool) {
+	route := rotationSessionKey(key)
+	if _, ok := sm.PendingRotation(route, session.ID); !ok {
+		return
+	}
+	state.mu.Lock()
+	state.rotationOutcome = rotationTurnOutcome{Complete: complete, Delivered: delivered}
+	state.mu.Unlock()
+	go func() {
+		e.rotationMu.Lock()
+		current := sm.LookupActive(route) == session && session.TryLock()
+		e.rotationMu.Unlock()
+		if !current {
+			return
+		}
+		defer e.releaseRotationReservation(session, sm, key)
+		e.finishScheduledRotation(state, session, sm, key, "", route)
+	}()
 }

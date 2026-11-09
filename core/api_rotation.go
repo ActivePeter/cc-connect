@@ -32,7 +32,7 @@ func rotationAPIError(w http.ResponseWriter, err error) {
 	if errors.Is(err, ErrRotationNotFound) {
 		status = http.StatusNotFound
 	}
-	if errors.Is(err, ErrRotationStale) {
+	if errors.Is(err, ErrRotationStale) || errors.Is(err, ErrRotationNativeBusy) {
 		status = http.StatusConflict
 	}
 	w.Header().Set("Content-Type", "application/json")

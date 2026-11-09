@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,12 @@ import (
 	"time"
 	"unicode/utf8"
 )
+
+// TopicInfoResolver optionally resolves missing group metadata for topic
+// creation only. Reply-context reconstruction and ordinary sends stay offline.
+type TopicInfoResolver interface {
+	ResolveTopicInfo(context.Context, any) (TopicInfo, error)
+}
 
 type TopicRecord struct {
 	BodyHash string `json:"body_sha256"`
@@ -148,6 +155,12 @@ func (e *Engine) CreateTopic(req TopicRequest) (TopicRecord, error) {
 		return TopicRecord{}, fmt.Errorf("platform does not support topic creation")
 	}
 	info := tp.TopicInfo(target.replyCtx)
+	if resolver, ok := tp.(TopicInfoResolver); ok {
+		info, err = resolver.ResolveTopicInfo(e.ctx, target.replyCtx)
+		if err != nil {
+			return TopicRecord{}, fmt.Errorf("resolve topic group context: %w", err)
+		}
+	}
 	if info.ChatID == "" {
 		return TopicRecord{}, fmt.Errorf("not a group context")
 	}

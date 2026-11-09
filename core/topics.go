@@ -44,22 +44,27 @@ type topicEnvelope struct {
 	msg *Message
 }
 type topicRun struct {
-	startMu     sync.Mutex
-	cancelled   atomic.Bool
-	dispatching bool
-	inbox       []topicEnvelope
+	workMu        sync.Mutex
+	goalOnlySince time.Time
+	goalTimer     *time.Timer
+	goalTimerAt   time.Time
+	startMu       sync.Mutex
+	cancelled     atomic.Bool
+	dispatching   bool
+	inbox         []topicEnvelope
 }
 type topicGroup struct {
-	stopMu   sync.Mutex
-	platform string
-	chat     string
-	limit    int
-	stopping bool
-	running  map[string]*topicRun
-	waiting  map[string][]topicEnvelope
-	order    []string
-	known    map[string]struct{}
-	closing  map[string]int
+	stopMu         sync.Mutex
+	platform       string
+	chat           string
+	limit          int
+	stopping       bool
+	running        map[string]*topicRun
+	waiting        map[string][]topicEnvelope
+	order          []string
+	known          map[string]struct{}
+	closing        map[string]int
+	goalGeneration map[string]uint64
 }
 type TopicSessionStatus struct {
 	SessionKey   string `json:"session_key"`
@@ -75,7 +80,7 @@ func topicGroupID(platform, chat string) string { return platform + "\x00" + cha
 
 func (e *Engine) routeTopicMessage(p Platform, msg *Message) bool {
 	policy, ok := p.(TopicSessionPolicy)
-	if !ok || msg == nil || msg.topicAdmitted || msg.Recalled || msg.IsPermissionResponse || isTopicStopCommand(msg.Content) {
+	if !ok || msg == nil || msg.topicAdmitted || msg.Recalled || msg.IsPermissionResponse || (len(msg.Images) == 0 && len(msg.Files) == 0 && msg.Audio == nil && isTopicControlCommand(msg.Content)) {
 		return false
 	}
 	chat, thread, limit := policy.TopicSession(msg.ReplyCtx)
@@ -95,10 +100,12 @@ func (e *Engine) routeTopicMessage(p Platform, msg *Message) bool {
 	id := topicGroupID(p.Name(), chat)
 	g := e.topicGroups[id]
 	if g == nil {
-		g = &topicGroup{platform: p.Name(), chat: chat, limit: limit, running: map[string]*topicRun{}, waiting: map[string][]topicEnvelope{}, known: map[string]struct{}{}, closing: map[string]int{}}
+		g = &topicGroup{platform: p.Name(), chat: chat, limit: limit, running: map[string]*topicRun{}, waiting: map[string][]topicEnvelope{}, known: map[string]struct{}{}, closing: map[string]int{}, goalGeneration: map[string]uint64{}}
 		e.topicGroups[id] = g
 	}
 	g.known[msg.SessionKey] = struct{}{}
+	cp.topicGoalSet = isTopicGoalSet(msg.Content)
+	cp.topicGoalGeneration = g.goalGeneration[msg.SessionKey]
 	if g.stopping || e.ctx.Err() != nil {
 		e.topicMu.Unlock()
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTopicStopping))
@@ -179,33 +186,69 @@ func (e *Engine) dispatchTopicInbox(id, key string, r *topicRun) {
 	}
 }
 func (e *Engine) topicIdle(key string) {
-	// Legacy configurations must not resolve workspaces or create state here.
 	e.topicMu.Lock()
-	relevant := false
-	for _, g := range e.topicGroups {
+	var id string
+	var r *topicRun
+	for gid, g := range e.topicGroups {
 		if g.running[key] != nil {
-			relevant = true
+			id, r = gid, g.running[key]
 			break
 		}
 	}
 	e.topicMu.Unlock()
-	if !relevant {
+	if r == nil {
 		return
 	}
-	_, sm := e.sessionContextForKey(key)
+	// Read backend state without topicMu; callbacks may wake us during startup/close.
+	r.workMu.Lock()
+	defer r.workMu.Unlock()
+	work := e.topicWorkSnapshot(key)
+	now := time.Now()
 	e.topicMu.Lock()
-	var starts []func()
-	for id, g := range e.topicGroups {
-		r := g.running[key]
-		if r == nil || r.dispatching {
-			continue
-		}
-		if s := sm.LookupActive(key); s != nil && s.Busy() {
-			continue
-		}
-		delete(g.running, key)
-		starts = append(starts, e.pumpTopicsLocked(id, g)...)
+	g := e.topicGroups[id]
+	if g == nil || g.running[key] != r {
+		e.topicMu.Unlock()
+		return
 	}
+	hardBusy := g.closing[key] > 0 || r.dispatching || work.frontBusy || work.nativeTurn || work.deferred > 0 || work.deliveryPending
+	occupied := hardBusy
+	if work.goalActive && !hardBusy {
+		if r.goalOnlySince.IsZero() {
+			r.goalOnlySince = now
+		}
+		if work.lastNative.After(r.goalOnlySince) {
+			r.goalOnlySince = work.lastNative
+		}
+		timeout := e.topicGoalIdleTimeout
+		if timeout <= 0 {
+			timeout = NativeGoalIdleTimeout
+		}
+		deadline := r.goalOnlySince.Add(timeout)
+		if now.Before(deadline) {
+			occupied = true
+			if r.goalTimer == nil || !r.goalTimerAt.Equal(deadline) {
+				if r.goalTimer != nil {
+					r.goalTimer.Stop()
+				}
+				r.goalTimerAt = deadline
+				r.goalTimer = time.AfterFunc(time.Until(deadline), func() { e.topicIdle(key) })
+			}
+		}
+	} else {
+		r.goalOnlySince = time.Time{}
+	}
+	if !work.goalActive || hardBusy || !occupied {
+		if r.goalTimer != nil {
+			r.goalTimer.Stop()
+			r.goalTimer = nil
+		}
+	}
+	if occupied {
+		e.topicMu.Unlock()
+		return
+	}
+	delete(g.running, key)
+	starts := e.pumpTopicsLocked(id, g)
 	e.topicMu.Unlock()
 	for _, start := range starts {
 		start()
@@ -219,6 +262,10 @@ func (e *Engine) cancelTopic(key string) int {
 	for _, g := range e.topicGroups {
 		if r := g.running[key]; r != nil {
 			r.cancelled.Store(true)
+			if r.goalTimer != nil {
+				r.goalTimer.Stop()
+				r.goalTimer = nil
+			}
 			run = r
 			dropped = append(dropped, r.inbox...)
 			r.inbox = nil
@@ -344,6 +391,10 @@ func (e *Engine) closeTopics() {
 		g.stopping = true
 		for _, r := range g.running {
 			r.cancelled.Store(true)
+			if r.goalTimer != nil {
+				r.goalTimer.Stop()
+				r.goalTimer = nil
+			}
 			dropped = append(dropped, r.inbox...)
 			r.inbox = nil
 		}
@@ -399,6 +450,7 @@ func (e *Engine) trackTopicClose(interactiveKey string) func() {
 			e.topicMu.Lock()
 			group.closing[key]--
 			e.topicMu.Unlock()
+			go e.topicIdle(key)
 		}
 	}
 }

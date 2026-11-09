@@ -361,8 +361,12 @@ type LocationAttachment struct {
 
 // Message represents a unified incoming message from any platform.
 type Message struct {
-	topicAdmitted bool
-	topicRun      *topicRun
+	// Retain this admission generation when a goal enters the foreground FIFO;
+	// a dispatcher may enqueue only after a concurrent /goal clear completed.
+	topicGoalSet        bool
+	topicGoalGeneration uint64
+	topicAdmitted       bool
+	topicRun            *topicRun
 
 	rotationState *interactiveState // internal outbox delivery; never resurrect after a lifecycle command
 	SessionKey    string            // unique key for user context, e.g. "feishu:{chatID}:{userID}"
@@ -403,6 +407,10 @@ type Message struct {
 	// drop late redeliveries that reuse a new message_id but an older create_time
 	// than a message already processed. Zero means unset (no ordering hint).
 	UserMessageTimeMs int64
+
+	goalAuto      bool
+	goalObjective bool
+	goalStarted   func()
 }
 
 // EventType distinguishes different kinds of agent output.

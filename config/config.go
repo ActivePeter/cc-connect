@@ -477,6 +477,7 @@ type BatchInboxConfig struct {
 }
 
 type ProjectConfig struct {
+	GoalMode   string           `toml:"goal_mode,omitempty"`
 	BatchInbox BatchInboxConfig `toml:"batch_inbox"`
 	Name       string           `toml:"name"`
 	Mode       string           `toml:"mode,omitempty"`     // "" or "multi-workspace"

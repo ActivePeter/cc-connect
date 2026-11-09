@@ -51,8 +51,11 @@ func (p *Platform) resolveTopicTarget(to string) (string, error) {
 func (p *Platform) CreateTopic(ctx context.Context, reply any, to, title, body, request string) (core.TopicReceipt, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	info := p.TopicInfo(reply)
 	out := core.TopicReceipt{Status: "failed"}
+	info, err := p.ResolveTopicInfo(ctx, reply)
+	if err != nil {
+		return out, err
+	}
 	if info.ChatID == "" {
 		return out, fmt.Errorf("topic creation requires a group")
 	}

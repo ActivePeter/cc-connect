@@ -26,6 +26,13 @@ const (
 	claudeUsagePollInterval         = 100 * time.Millisecond
 	claudeUsageStableFor            = 450 * time.Millisecond
 	claudeUsageActionGap            = 250 * time.Millisecond
+	// claudeUsageReaderWait bounds how long the probe's cleanup waits for the
+	// pty reader. A blocked Read on a pty master cannot be interrupted by
+	// Close on Linux, so the wait must never be unbounded.
+	claudeUsageReaderWait = 2 * time.Second
+	// claudeUsageWaitDelay bounds cmd.Wait when an escaped descendant still
+	// holds the stderr pipe: exec closes the pipe after this delay.
+	claudeUsageWaitDelay = 2 * time.Second
 )
 
 var (
@@ -75,6 +82,7 @@ func (a *Agent) runClaudeUsageProbe(ctx context.Context) (string, error) {
 	}
 	cmd := exec.CommandContext(probeCtx, "claude", args...)
 	cmd.Dir = workDir
+	cmd.WaitDelay = claudeUsageWaitDelay
 
 	env := filterEnv(os.Environ(), "CLAUDECODE")
 	env = append(env, "DISABLE_TELEMETRY=true")
@@ -120,22 +128,8 @@ func (a *Agent) runClaudeUsageProbe(ctx context.Context) (string, error) {
 	}()
 
 	defer func() {
-		if err := ptmx.Close(); err != nil {
-			slog.Warn("claudeSession: close ptmx", "error", err)
-		}
 		cancel()
-		// Wait for reader goroutine to finish so it is never leaked.
-		<-readDone
-		select {
-		case <-processDone:
-		case <-time.After(2 * time.Second):
-			if cmd.Process != nil {
-				if err := cmd.Process.Kill(); err != nil {
-					slog.Warn("claudeSession: kill process", "error", err)
-				}
-			}
-			<-processDone
-		}
+		finishClaudeUsageProbe(ptmx, cmd, readDone, processDone)
 	}()
 
 	ticker := time.NewTicker(claudeUsagePollInterval)
@@ -196,6 +190,31 @@ func (a *Agent) runClaudeUsageProbe(ctx context.Context) (string, error) {
 				}
 			}
 		}
+	}
+}
+
+// finishClaudeUsageProbe releases the probe's pty and process group. pty.Start
+// makes claude a session leader and its children (MCP servers, hooks) inherit
+// the pty slave; closing the master does not interrupt a Read that is already
+// blocked on Linux, so the whole group is killed to release the slave. The
+// reader wait is bounded: this cleanup runs on the turn-completion path and
+// must never block it (the goroutine may be left to die with the group).
+func finishClaudeUsageProbe(ptmx *os.File, cmd *exec.Cmd, readDone <-chan error, processDone <-chan struct{}) {
+	if err := ptmx.Close(); err != nil {
+		slog.Warn("claudeSession: close ptmx", "error", err)
+	}
+	if err := forceKillCmd(cmd); err != nil {
+		slog.Warn("claudeSession: kill usage probe group", "error", err)
+	}
+	select {
+	case <-readDone:
+	case <-time.After(claudeUsageReaderWait):
+		slog.Warn("claudeSession: usage probe reader still blocked after cleanup")
+	}
+	select {
+	case <-processDone:
+	case <-time.After(claudeUsageReaderWait):
+		slog.Warn("claudeSession: usage probe process did not exit in time")
 	}
 }
 

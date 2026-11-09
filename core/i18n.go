@@ -179,6 +179,10 @@ const (
 	MsgPreviousProcessing        MsgKey = "previous_processing"
 	MsgQueueFull                 MsgKey = "queue_full"
 	MsgMessageQueued             MsgKey = "message_queued"
+	MsgDeferredMessageQueued     MsgKey = "deferred_message_queued"
+	MsgDeferredAttachmentQueued  MsgKey = "deferred_attachment_queued"
+	MsgDeferredMessageSent       MsgKey = "deferred_message_sent"
+	MsgDeferredQueueCleared      MsgKey = "deferred_queue_cleared"
 	MsgMessageInjected           MsgKey = "message_injected"
 	MsgNoToolsAllowed            MsgKey = "no_tools_allowed"
 	MsgCurrentTools              MsgKey = "current_tools"
@@ -755,6 +759,34 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "⏳ 上一個請求仍在處理中。使用 `/ps <訊息>` 可向正在執行的任務追加補充資訊。",
 		LangJapanese:           "⏳ 前のリクエストを処理中です。`/ps <メッセージ>` で実行中のタスクに補足情報を送れます。",
 		LangSpanish:            "⏳ La solicitud anterior aún se está procesando. Use `/ps <mensaje>` para enviar un P.S. a la tarea en curso.",
+	},
+	MsgDeferredMessageQueued: {
+		LangEnglish:            "📬 Queued; will insert at the next available step.",
+		LangChinese:            "📬 已排队，下一步插入。",
+		LangTraditionalChinese: "📬 已排隊，下一步插入。",
+		LangJapanese:           "📬 キューに追加しました。次の受付可能なステップで挿入します。",
+		LangSpanish:            "📬 En cola; se insertará en el próximo paso disponible.",
+	},
+	MsgDeferredAttachmentQueued: {
+		LangEnglish:            "📬 Attachment queued; will process after this turn ends.",
+		LangChinese:            "📬 附件已排队，本轮结束后处理。",
+		LangTraditionalChinese: "📬 附件已排隊，本輪結束後處理。",
+		LangJapanese:           "📬 添付ファイルをキューに追加しました。このターン終了後に処理します。",
+		LangSpanish:            "📬 Adjunto en cola; se procesará al terminar este turno.",
+	},
+	MsgDeferredMessageSent: {
+		LangEnglish:            "📨 Queued message sent as new input.",
+		LangChinese:            "📨 排队消息已作为新输入发出。",
+		LangTraditionalChinese: "📨 排隊訊息已作為新輸入送出。",
+		LangJapanese:           "📨 キュー内のメッセージを新しい入力として送信しました。",
+		LangSpanish:            "📨 Mensaje de la cola enviado como nueva entrada.",
+	},
+	MsgDeferredQueueCleared: {
+		LangEnglish:            "Cleared %d queued message(s).",
+		LangChinese:            "已清空 %d 条排队消息。",
+		LangTraditionalChinese: "已清空 %d 條排隊訊息。",
+		LangJapanese:           "キュー内のメッセージを %d 件削除しました。",
+		LangSpanish:            "Se borraron %d mensajes de la cola.",
 	},
 	MsgMessageInjected: {
 		LangEnglish:            "📨 Message added to the running task.",
