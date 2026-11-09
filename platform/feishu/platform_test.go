@@ -905,6 +905,7 @@ func TestLark_ReconstructReplyCtx(t *testing.T) {
 		t.Fatalf("newPlatform(lark) error = %v", err)
 	}
 	base := p.(*Platform)
+	base.cacheEventChatType("oc_chat123", "group")
 
 	rctx, err := base.ReconstructReplyCtx("lark:oc_chat123:ou_user456")
 	if err != nil {

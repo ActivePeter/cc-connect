@@ -156,6 +156,7 @@ type Platform struct {
 	mentionMap       map[string]string // agent name -> open_id (for outbound @ resolution)
 	userNameCache    sync.Map          // open_id -> display name
 	chatNameCache    sync.Map          // chat_id -> chat name
+	groupChatCache   sync.Map          // chat_id -> bool; confirmed by event chat_type or SDK chat_mode
 	chatMemberCache  sync.Map          // chatID -> *chatMemberEntry
 	recalledMu       sync.Mutex
 	recalledMsgIDs   map[string]time.Time // message_id -> recall time, short TTL race guard
@@ -1395,6 +1396,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	if msg.ChatType != nil {
 		chatType = *msg.ChatType
 	}
+	p.cacheEventChatType(chatID, chatType)
 	mentionCount := len(msg.Mentions)
 	slog.Debug(p.tag()+": inbound message",
 		"message_id", messageID,
@@ -3909,7 +3911,11 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	if len(parts) < 2 || parts[0] != p.platformName {
 		return nil, fmt.Errorf("%s: invalid session key %q", p.tag(), sessionKey)
 	}
-	rc := replyContext{chatID: parts[1], sessionKey: sessionKey}
+	groupChat, err := p.resolveGroupChat(context.Background(), parts[1])
+	if err != nil {
+		return nil, err
+	}
+	rc := replyContext{chatID: parts[1], sessionKey: sessionKey, groupChat: groupChat}
 	if p.topicOnly && len(parts) == 3 && strings.HasPrefix(parts[2], "thread:") {
 		thread := strings.TrimPrefix(parts[2], "thread:")
 		items, err := p.topicMessages(context.Background(), thread)
@@ -3922,7 +3928,6 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 		rc.messageID = stringValue(items[0].MessageId)
 		rc.threadID = thread
 		rc.rootID = stringValue(items[0].RootId)
-		rc.groupChat = true
 		return rc, nil
 	}
 
