@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/chenhg5/cc-connect/core"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
@@ -60,4 +61,21 @@ func (p *Platform) resolveGroupChat(ctx context.Context, chatID string) (bool, e
 	}
 	p.groupChatCache.Store(chatID, group)
 	return group, nil
+}
+
+// ResolveTopicInfo may query missing chat type only for explicit topic creation.
+// TopicInfo remains a pure projection for inbound routing and topic prefixes.
+func (p *Platform) ResolveTopicInfo(ctx context.Context, reply any) (core.TopicInfo, error) {
+	rc, ok := reply.(replyContext)
+	if !ok || rc.chatID == "" {
+		return core.TopicInfo{}, fmt.Errorf("%s: topic creation requires a chat context", p.tag())
+	}
+	if !rc.groupChat {
+		group, err := p.resolveGroupChat(ctx, rc.chatID)
+		if err != nil {
+			return core.TopicInfo{}, err
+		}
+		rc.groupChat = group
+	}
+	return p.TopicInfo(rc), nil
 }

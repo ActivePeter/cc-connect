@@ -3911,11 +3911,12 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	if len(parts) < 2 || parts[0] != p.platformName {
 		return nil, fmt.Errorf("%s: invalid session key %q", p.tag(), sessionKey)
 	}
-	groupChat, err := p.resolveGroupChat(context.Background(), parts[1])
-	if err != nil {
-		return nil, err
+	rc := replyContext{chatID: parts[1], sessionKey: sessionKey}
+	// A cold session key does not carry chat type. Metadata lookups belong to
+	// topic creation, never the ordinary send/timer/cron reconstruction path.
+	if group, known := p.groupChatCache.Load(parts[1]); known {
+		rc.groupChat = group.(bool)
 	}
-	rc := replyContext{chatID: parts[1], sessionKey: sessionKey, groupChat: groupChat}
 	if p.topicOnly && len(parts) == 3 && strings.HasPrefix(parts[2], "thread:") {
 		thread := strings.TrimPrefix(parts[2], "thread:")
 		items, err := p.topicMessages(context.Background(), thread)
@@ -3928,6 +3929,7 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 		rc.messageID = stringValue(items[0].MessageId)
 		rc.threadID = thread
 		rc.rootID = stringValue(items[0].RootId)
+		rc.groupChat = true
 		return rc, nil
 	}
 
