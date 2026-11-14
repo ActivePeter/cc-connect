@@ -116,7 +116,10 @@ type replyContext struct {
 	bootstrapThread bool
 	requesterID     string
 	requesterName   string
-	groupChat       bool
+	// senderID is the open_id of whoever triggered this turn, human or bot.
+	// The completion fallback uses it to never mention the triggering bot.
+	senderID  string
+	groupChat bool
 }
 
 type Platform struct {
@@ -140,6 +143,7 @@ type Platform struct {
 	topicOnly                    bool
 	topicConcurrency             int
 	mentionRequesterOnCompletion bool
+	completionFallbackMention    string
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	resolveMentions  bool
@@ -338,6 +342,11 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	}
 
 	mentionRequesterOnCompletion, _ := opts["mention_requester_on_completion"].(bool)
+	completionFallbackMention, _ := opts["completion_fallback_mention"].(string)
+	completionFallbackMention = strings.TrimSpace(completionFallbackMention)
+	if strings.EqualFold(completionFallbackMention, "all") {
+		return nil, fmt.Errorf("%s: completion_fallback_mention must be a user open_id, not \"all\"", name)
+	}
 	resolveMentionsOpt, _ := opts["resolve_mentions"].(bool)
 	noReplyToTrigger := false
 	if v, ok := opts["reply_to_trigger"].(bool); ok && !v {
@@ -432,6 +441,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		topicOnly:                    topicMode == "topic_only",
 		topicConcurrency:             topicLimit,
 		mentionRequesterOnCompletion: mentionRequesterOnCompletion,
+		completionFallbackMention:    completionFallbackMention,
 		resolveMentions:              resolveMentionsOpt,
 		noReplyToTrigger:             noReplyToTrigger,
 		client:                       lark.NewClient(appID, appSecret, clientOpts...),
@@ -1466,6 +1476,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey, groupChat: chatType == "group", threadID: stringValue(msg.ThreadId), rootID: stringValue(msg.RootId)}
 	// Snapshot the actual human sender, not mentions in the prompt or mutable
 	// session state. Each queued turn must keep its own completion recipient.
+	rctx.senderID = userID
 	if stringValue(sender.SenderType) == "user" {
 		rctx.requesterID = userID
 	}
