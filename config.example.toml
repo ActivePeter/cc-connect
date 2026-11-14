@@ -1032,6 +1032,8 @@ app_secret = "your-feishu-app-secret"
 #                           # 设为 true 时，群聊按飞书话题/根消息隔离会话；multi-workspace 模式下每个话题也独立绑定 workspace
 # mention_requester_on_completion = false  # Send one native @ of the human requester after each final group reply; progress and private chats are unaffected
 #                           # 群聊最终回复后 @ 本轮发起人一次；中间进度和私聊不受影响
+# completion_fallback_mention = ""  # open_id to @ instead when the turn was triggered by a bot (no human requester); never mentions the triggering bot; needs mention_requester_on_completion
+#                           # 本轮由机器人触发（没有人类发起人）时改为 @ 这个 open_id；不会 @ 触发本轮的机器人；需同时开启 mention_requester_on_completion
 # reply_to_trigger = true   # Default: bot uses “reply to message” API (quotes the user’s message). Set false to post plain chat messages instead.
 #                           # 默认 true：用「回复消息」API（引用用户消息）。设为 false 则在会话里发普通消息、不引用触发消息。
 # progress_style = "legacy" # Progress rendering style: legacy | compact | card

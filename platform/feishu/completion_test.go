@@ -137,11 +137,112 @@ func TestCompletionMention_CapturesEachInboundRequester(t *testing.T) {
 			if senderType != "user" {
 				want = ""
 			}
-			if rc.requesterID != want || !rc.groupChat || rc.requesterName != "Sender "+id {
+			if rc.requesterID != want || rc.senderID != id || !rc.groupChat || rc.requesterName != "Sender "+id {
 				t.Fatalf("wrong requester context: %+v", rc)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("message was not dispatched")
 		}
+	}
+}
+
+// completionCapture starts a fake Feishu API and returns a platform wired to it
+// plus a channel of the text bodies it was asked to send.
+func completionCapture(t *testing.T, fallback string) (*Platform, chan string) {
+	t.Helper()
+	texts := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/auth/") {
+			writeJSON(t, w, map[string]any{"code": 0, "expire": 7200, "tenant_access_token": "test-token"})
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		var content map[string]string
+		if err := json.Unmarshal([]byte(body["content"].(string)), &content); err != nil {
+			t.Error(err)
+		}
+		texts <- content["text"]
+		writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"message_id": "om_result"}})
+	}))
+	t.Cleanup(srv.Close)
+	p := &Platform{
+		platformName: "feishu", mentionRequesterOnCompletion: true, completionFallbackMention: fallback,
+		client: lark.NewClient("completion-fallback", "test-secret", lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
+	}
+	p.userNameCache.Store("ou_owner", "Owner")
+	return p, texts
+}
+
+func TestCompletionMention_FallbackForBotTriggeredTurns(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		fallback string
+		rc       replyContext
+		want     string // "" means no notification may be sent
+	}{
+		{
+			name:     "human requester unchanged when fallback configured",
+			fallback: "ou_owner",
+			rc:       replyContext{messageID: "om_t", chatID: "oc_group", groupChat: true, requesterID: "ou_alice", requesterName: "Alice", senderID: "ou_alice"},
+			want:     `<at user_id="ou_alice">Alice</at> Done.`,
+		},
+		{
+			name:     "bot requester uses fallback",
+			fallback: "ou_owner",
+			rc:       replyContext{messageID: "om_t", chatID: "oc_group", groupChat: true, requesterName: "Peer Bot", senderID: "ou_peer_bot"},
+			want:     `<at user_id="ou_owner">Owner</at> Done.`,
+		},
+		{
+			name: "bot requester without fallback stays silent",
+			rc:   replyContext{messageID: "om_t", chatID: "oc_group", groupChat: true, requesterName: "Peer Bot", senderID: "ou_peer_bot"},
+		},
+		{
+			name:     "fallback never mentions the triggering bot",
+			fallback: "ou_peer_bot",
+			rc:       replyContext{messageID: "om_t", chatID: "oc_group", groupChat: true, senderID: "ou_peer_bot"},
+		},
+		{
+			name:     "fallback not used in private chats",
+			fallback: "ou_owner",
+			rc:       replyContext{messageID: "om_t", chatID: "oc_p2p", senderID: "ou_peer_bot"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, texts := completionCapture(t, tc.fallback)
+			if err := p.NotifyFinalReply(context.Background(), tc.rc, "Done."); err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for len(texts) > 0 {
+				got = append(got, <-texts)
+			}
+			switch {
+			case tc.want == "" && len(got) != 0:
+				t.Fatalf("expected no notification, got %q", got)
+			case tc.want != "" && (len(got) != 1 || got[0] != tc.want):
+				t.Fatalf("got %q, want exactly [%q]", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCompletionMention_FallbackOption(t *testing.T) {
+	p, err := newPlatform("feishu", lark.FeishuBaseUrl, map[string]any{"app_id": "test", "app_secret": "test", "mention_requester_on_completion": true, "completion_fallback_mention": " ou_owner "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, ok := p.(*Platform)
+	if !ok {
+		base = p.(*interactivePlatform).Platform
+	}
+	if base.completionFallbackMention != "ou_owner" {
+		t.Fatalf("fallback=%q", base.completionFallbackMention)
+	}
+	if _, err := newPlatform("feishu", lark.FeishuBaseUrl, map[string]any{"app_id": "test", "app_secret": "test", "completion_fallback_mention": "all"}); err == nil {
+		t.Fatal("expected \"all\" to be rejected")
 	}
 }

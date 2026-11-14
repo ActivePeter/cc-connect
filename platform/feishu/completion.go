@@ -19,14 +19,27 @@ func (p *Platform) NotifyFinalReply(ctx context.Context, replyCtx any, message s
 		return nil
 	}
 	rc, ok := replyCtx.(replyContext)
-	if !ok || !rc.groupChat || rc.chatID == "" || rc.requesterID == "" || strings.EqualFold(rc.requesterID, "all") {
+	if !ok || !rc.groupChat || rc.chatID == "" {
 		return nil
 	}
-	name := rc.requesterName
-	if name == "" {
-		name = rc.requesterID
+	target, name := rc.requesterID, rc.requesterName
+	if target == "" {
+		// Bot-triggered (or unknown-sender) turn: fall back to the configured
+		// human so someone is still notified. Never mention the bot that
+		// triggered the turn, or two bots would keep waking each other up.
+		target = p.completionFallbackMention
+		if target == "" || strings.EqualFold(target, rc.senderID) {
+			return nil
+		}
+		name = p.resolveUserName(target)
 	}
-	content := fmt.Sprintf(`<at user_id="%s">%s</at> %s`, html.EscapeString(rc.requesterID), html.EscapeString(name), html.EscapeString(message))
+	if strings.EqualFold(target, "all") {
+		return nil
+	}
+	if name == "" {
+		name = target
+	}
+	content := fmt.Sprintf(`<at user_id="%s">%s</at> %s`, html.EscapeString(target), html.EscapeString(name), html.EscapeString(message))
 	// Reuse normal routing so thread replies and reply_to_trigger retain their
 	// configured behavior. The native <at> tag selects Feishu's text message API.
 	if err := p.Reply(ctx, rc, content); err != nil {
